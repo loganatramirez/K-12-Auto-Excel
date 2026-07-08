@@ -1,0 +1,19 @@
+# dependencies
+node_modules/
+
+# Next.js
+.next/
+out/
+
+# production
+build/
+
+# local env files
+.env*
+!.env.example
+
+# TypeScript
+*.tsbuildinfo
+
+# generated imports
+tmp/

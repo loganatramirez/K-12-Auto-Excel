@@ -611,18 +611,56 @@ function mergeSupabaseRows(
     };
   });
 
-  const mergedCustomRows: WorkspaceRecord[] = customRows.map((row) => ({
-    id: row.id,
-    module: row.module,
-    title: row.title,
-    subtitle: row.subtitle ?? "Custom row",
-    updatedAt: row.updated_at?.slice(0, 10) ?? new Date().toISOString().slice(0, 10),
-    kind: row.kind ?? "record",
-    tone: row.tone ?? undefined,
-    fields: fieldsForRow(row.module, row.fields ?? {})
-  }));
+  const visibleCustomRows = removeGeneratedCdiacImportBlock(customRows);
+  const mergedCustomRows: WorkspaceRecord[] = visibleCustomRows
+    .map((row) => ({
+      id: row.id,
+      module: row.module,
+      title: row.title,
+      subtitle: row.subtitle ?? "Custom row",
+      updatedAt: row.updated_at?.slice(0, 10) ?? new Date().toISOString().slice(0, 10),
+      kind: row.kind ?? "record",
+      tone: row.tone ?? undefined,
+      fields: fieldsForRow(row.module, row.fields ?? {})
+    }));
 
   return [...mergedBaseRows, ...mergedCustomRows];
+}
+
+function removeGeneratedCdiacImportBlock(rows: WorkbookCustomRow[]) {
+  const generatedBlockStart = rows.findIndex(isGeneratedCdiacSectionRow);
+
+  if (generatedBlockStart >= 0) {
+    return rows.filter((row, index) => row.module !== "k12-targets" || index < generatedBlockStart);
+  }
+
+  return rows.filter((row) => !isGeneratedCdiacImportRow(row));
+}
+
+function isGeneratedCdiacSectionRow(row: WorkbookCustomRow) {
+  if (row.module !== "k12-targets") {
+    return false;
+  }
+
+  const fields = row.fields ?? {};
+  const district = normalizeImportMarker(fields.District ?? row.title);
+
+  return district === "cdiac issuer records";
+}
+
+function isGeneratedCdiacImportRow(row: WorkbookCustomRow) {
+  if (row.module !== "k12-targets") {
+    return false;
+  }
+
+  const fields = row.fields ?? {};
+  const area = normalizeImportMarker(fields.Area ?? row.subtitle ?? "");
+
+  return area === "cdiac import";
+}
+
+function normalizeImportMarker(value: FieldValue | null | undefined) {
+  return String(value ?? "").trim().toLowerCase();
 }
 
 function isCellLocked(row?: WorkspaceRecord, column?: ColumnDef) {
