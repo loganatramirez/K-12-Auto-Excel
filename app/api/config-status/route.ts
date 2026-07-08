@@ -21,11 +21,14 @@ export function GET() {
   const perplexityApiKey = getPerplexityApiKey();
   const pubfinApiKey = getPubfinApiKey();
   const openAIApiKey = getOpenAIApiKey();
+  const supabaseHost = safeHost(supabaseUrl);
 
   return NextResponse.json({
     supabaseConfigured: isSupabaseConfigured(),
     supabaseUrlPresent: Boolean(supabaseUrl),
     supabaseUrlLength: supabaseUrl.length,
+    supabaseHost,
+    supabaseProjectRef: supabaseHost.endsWith(".supabase.co") ? supabaseHost.replace(".supabase.co", "") : "",
     supabaseAnonKeyPresent: Boolean(supabaseAnonKey),
     supabaseAnonKeyLength: supabaseAnonKey.length,
     signupConfigured: Boolean(supabaseServiceRoleKey && signupAccessCode),
@@ -44,4 +47,16 @@ export function GET() {
     openAIApiKeyLength: openAIApiKey.length,
     claudeDisabled: true
   });
+}
+
+function safeHost(value: string) {
+  if (!value) {
+    return "";
+  }
+
+  try {
+    return new URL(value).host;
+  } catch {
+    return "";
+  }
 }
