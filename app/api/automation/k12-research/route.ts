@@ -1310,18 +1310,8 @@ async function researchDealTeamFromL1(
     return null;
   }
 
-  if (latestRows.length > 1) {
-    return {
-      candidate_diagnostics: [
-        `L1 found ${latestRows.length} same-day state filing deals for ${institution}; manual review is needed before choosing Last Deal.`
-      ],
-      fields: [],
-      source_candidates: latestRows.map((row) => l1SourceCandidate(row, institution)),
-      source_count: latestRows.length
-    };
-  }
-
-  const enrichedLatestDeal = await enrichL1DealFromDebtWatch(latestDeal);
+  const selectedDeal = latestRows.length > 1 ? selectBestL1Deal(latestRows, institution) : latestDeal;
+  const enrichedLatestDeal = await enrichL1DealFromDebtWatch(selectedDeal);
   const fields = buildL1DealFields(enrichedLatestDeal, moduleKey);
 
   if (!fields.length) {
@@ -1329,7 +1319,11 @@ async function researchDealTeamFromL1(
   }
 
   return {
-    candidate_diagnostics: [`L1 state filing deal found for ${institution}: ${formatL1DealSummary(enrichedLatestDeal)}.`],
+    candidate_diagnostics: [
+      latestRows.length > 1
+        ? `L1 found ${latestRows.length} same-day state filing deals for ${institution}; selected the strongest match: ${formatL1DealSummary(enrichedLatestDeal)}.`
+        : `L1 state filing deal found for ${institution}: ${formatL1DealSummary(enrichedLatestDeal)}.`
+    ],
     deal_follow_up_seeds: [
       {
         confidence: l1Confidence(enrichedLatestDeal),
@@ -1732,22 +1726,166 @@ async function researchDealTeamFromL1ByInstitution(
 }
 
 function filterL1DealRowsForInstitution(rows: MuniDealFactRow[], institution: string) {
-  return rows.filter((row) => {
-    const normalizedEvidence = normalizeIdentityText(
-      [
-        row.record_id,
-        row.issuer_id,
-        row.issuer_name_reported,
-        row.related_entity_name,
-        row.deal_name,
-        row.source_excerpt
-      ]
-        .filter(Boolean)
-        .join(" ")
-    );
+  return rows
+    .map((row) => ({
+      row,
+      score: l1InstitutionMatchScore(row, institution)
+    }))
+    .filter(({ score }) => score >= 10)
+    .sort((left, right) => {
+      const dateCompare = String(right.row.deal_sale_date ?? "").localeCompare(String(left.row.deal_sale_date ?? ""));
 
-    return dealEvidenceMentionsInstitution(normalizedEvidence, institution);
-  });
+      if (dateCompare) {
+        return dateCompare;
+      }
+
+      const scoreCompare = right.score - left.score;
+
+      if (scoreCompare) {
+        return scoreCompare;
+      }
+
+      return l1ParAmount(right.row) - l1ParAmount(left.row);
+    })
+    .map(({ row }) => row);
+}
+
+function selectBestL1Deal(rows: MuniDealFactRow[], institution: string) {
+  return [...rows].sort((left, right) => {
+    const scoreCompare = l1InstitutionMatchScore(right, institution) - l1InstitutionMatchScore(left, institution);
+
+    if (scoreCompare) {
+      return scoreCompare;
+    }
+
+    const parCompare = l1ParAmount(right) - l1ParAmount(left);
+
+    if (parCompare) {
+      return parCompare;
+    }
+
+    return String(left.deal_state_id ?? "").localeCompare(String(right.deal_state_id ?? ""));
+  })[0];
+}
+
+function l1InstitutionMatchScore(row: MuniDealFactRow, institution: string) {
+  const normalizedEvidence = l1NormalizedEvidence(row);
+
+  if (dealEvidenceMentionsInstitution(normalizedEvidence, institution)) {
+    return 100 + l1SchoolFinanceScore(normalizedEvidence);
+  }
+
+  const coreAliases = l1InstitutionCoreAliases(institution);
+  const matchedCoreAlias = coreAliases.find((alias) => normalizedEvidence.includes(alias));
+
+  if (!matchedCoreAlias) {
+    return 0;
+  }
+
+  const coreTokenCount = matchedCoreAlias.split(" ").length;
+  const schoolFinanceScore = l1SchoolFinanceScore(normalizedEvidence);
+
+  if (coreTokenCount === 1 && matchedCoreAlias.length < 7) {
+    return 0;
+  }
+
+  if (schoolFinanceScore < 4) {
+    return 0;
+  }
+
+  return 8 + Math.min(coreTokenCount, 4) * 2 + schoolFinanceScore;
+}
+
+function l1NormalizedEvidence(row: MuniDealFactRow) {
+  return normalizeIdentityText(
+    [
+      row.record_id,
+      row.issuer_id,
+      row.issuer_name_reported,
+      row.related_entity_name,
+      row.deal_name,
+      row.source_excerpt
+    ]
+      .filter(Boolean)
+      .join(" ")
+  );
+}
+
+function l1InstitutionCoreAliases(institution: string) {
+  const aliases = uniqueStrings([
+    institution,
+    ...k12SearchAliases(institution),
+    ...ccdSearchAliases(institution)
+  ]);
+  const suffixPhrases = [
+    "joint union high school district",
+    "joint unified school district",
+    "union high school district",
+    "unified school district",
+    "elementary school district",
+    "high school district",
+    "city school district",
+    "community college district",
+    "school district",
+    "public financing authority",
+    "financing authority",
+    "district",
+    "usd",
+    "juhsd",
+    "jushd",
+    "jusd",
+    "uhsd",
+    "hsd",
+    "esd",
+    "csd",
+    "sd",
+    "ccd"
+  ];
+
+  return uniqueStrings(
+    aliases
+      .map(normalizeIdentityText)
+      .flatMap((alias) => {
+        const stripped = suffixPhrases.reduce(
+          (value, suffix) => value.replace(new RegExp(`\\b${suffix}\\b`, "g"), " "),
+          alias
+        );
+
+        return [alias, normalizeIdentityText(stripped)];
+      })
+      .filter((alias) => alias.length >= 7)
+  );
+}
+
+function l1SchoolFinanceScore(normalizedEvidence: string) {
+  return keywordScore(normalizedEvidence, [
+    ["school district", 8],
+    ["unified school district", 8],
+    ["elementary school district", 7],
+    ["high school district", 7],
+    ["union high school district", 7],
+    ["joint unified school district", 7],
+    ["joint union high school district", 7],
+    ["school facilities", 6],
+    ["general obligation", 5],
+    ["public financing authority", 5],
+    ["school financing", 5],
+    ["school finance", 5],
+    ["community facilities district", 4],
+    ["special tax", 4],
+    ["cfd", 3],
+    ["sfid", 3],
+    ["education", 2],
+    ["bond", 2],
+    ["bonds", 2],
+    ["refunding", 2]
+  ]);
+}
+
+function l1ParAmount(row: MuniDealFactRow) {
+  const numericValue = Number(row.deal_par_amount);
+
+  return Number.isFinite(numericValue) ? numericValue : 0;
 }
 
 function isMissingMuniPipelineTableError(error: { code?: string; message?: string }) {
