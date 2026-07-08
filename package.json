@@ -7,7 +7,8 @@
     "build": "next build",
     "start": "next start",
     "typecheck": "tsc --noEmit",
-    "prepare:muni-import": "node scripts/prepare-muni-deal-import.mjs"
+    "prepare:muni-import": "node scripts/prepare-muni-deal-import.mjs",
+    "prepare:k12-static-remap": "node scripts/prepare-static-deal-remap-sql.mjs"
   },
   "dependencies": {
     "@supabase/ssr": "^0.12.0",
