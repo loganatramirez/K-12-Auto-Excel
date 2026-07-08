@@ -63,11 +63,19 @@ const moduleTabs: Array<{ key: ModuleKey; label: string; description: string }> 
 const workflowGroups: Record<ModuleKey, WorkflowGroup[]> = {
   "k12-targets": [
     {
-      key: "deal-team",
-      label: "Last Deal / MA / UW / BC",
-      fields: ["Last Deal", "MA", "UW", "BC"],
+      key: "last-deal",
+      label: "Last Deal",
+      fields: ["Last Deal"],
       cadence:
-        "Suggested manual cadence: monthly for active targets. Uses a query matrix first, then keeps a larger candidate pool before ranking sources. Newest deal wins: 2025/2026 sources are preferred, and 2023/2024 are fallback only. EMMA/OS/POS is the main path when reachable; if EMMA cannot be read directly, OS/POS PDFs, CDIAC/DebtWatch, agenda/minutes, staff reports, resolutions, transaction pages, BondLink, and MuniOS are ranked as supporting paths. Lower-confidence deal candidates enter review, but never auto-apply.",
+        "Suggested manual cadence: monthly for active targets. Uses the local CDIAC/DebtWatch deal-facts dataset first and only proposes a Last Deal for existing workbook targets.",
+      isAvailable: true
+    },
+    {
+      key: "deal-team",
+      label: "MA / UW / BC",
+      fields: ["MA", "UW", "BC"],
+      cadence:
+        "Suggested manual cadence: monthly for active targets after Last Deal review. Uses CDIAC/DebtWatch Reports Section by default; web/model fallback only runs when explicitly enabled.",
       isAvailable: true
     },
     {
@@ -87,11 +95,20 @@ const workflowGroups: Record<ModuleKey, WorkflowGroup[]> = {
   ],
   "ccd-targets": [
     {
-      key: "ccd-finance",
-      label: "Authorizations / Refundings / Deal Team",
-      fields: ["Authorizations", "Refundings", "Underwriter", "MA", "BC"],
-      cadence: "CCD automation is not wired yet. This tab is ready for CCD review once the scanner is added.",
-      isAvailable: false
+      key: "ccd-deal-facts",
+      label: "Last Deal",
+      fields: ["Last Deal"],
+      cadence:
+        "Suggested manual cadence: monthly for active CCD targets. Uses the local CDIAC/DebtWatch deal-facts dataset first.",
+      isAvailable: true
+    },
+    {
+      key: "ccd-deal-team",
+      label: "Underwriter / MA / BC",
+      fields: ["Underwriter", "MA", "BC"],
+      cadence:
+        "Suggested manual cadence: monthly after Last Deal review. Uses CDIAC/DebtWatch Reports Section by default; web/model fallback only runs when explicitly enabled.",
+      isAvailable: true
     },
     {
       key: "ccd-leadership",
@@ -153,7 +170,7 @@ export function UpdateCenter() {
   );
   const [busyId, setBusyId] = useState<string | null>(null);
   const [isAutomationRunning, setIsAutomationRunning] = useState(false);
-  const [activeWorkflowKey, setActiveWorkflowKey] = useState("deal-team");
+  const [activeWorkflowKey, setActiveWorkflowKey] = useState("last-deal");
   const [sourceCandidates, setSourceCandidates] = useState<InstitutionSourceCandidates[]>([]);
   const [institutionQuery, setInstitutionQuery] = useState("");
   const [reviewStatusFilter, setReviewStatusFilter] = useState<ReviewStatusFilter>("pending");
@@ -375,6 +392,7 @@ export function UpdateCenter() {
     });
     const result = (await response.json()) as {
       created?: number;
+      dealTeamWebFallbackEnabled?: boolean | null;
       diagnostics?: Array<{ institution: string; message: string }>;
       error?: string;
       errors?: Array<{ institution: string; error: string }>;
@@ -402,12 +420,19 @@ export function UpdateCenter() {
     setSourceCandidates(result.sourceCandidates ?? []);
     setIsAutomationRunning(false);
     setStatus("Ready");
-    const providerText = result.extractors?.length
+    const isDealTeamCdiacOnly = result.dealTeamWebFallbackEnabled === false;
+    const providerText = !isDealTeamCdiacOnly && result.extractors?.length
       ? ` Providers: ${result.extractors.map(providerLabel).join(", ")}.`
       : "";
-    const providerErrorText = result.providerErrors?.length
+    const providerErrorText = !isDealTeamCdiacOnly && result.providerErrors?.length
       ? ` Provider issues: ${summarizeProviderErrors(result.providerErrors)}.`
       : "";
+    const researchModeText = isDealTeamCdiacOnly
+      ? " Mode: CDIAC-only; web/model fallback is off."
+      : result.dealTeamWebFallbackEnabled
+        ? " Mode: CDIAC first, web/model fallback enabled."
+        : "";
+    const sourceLabel = isDealTeamCdiacOnly ? "CDIAC/DebtWatch records" : "sources";
     const diagnosticText = result.diagnostics?.length
       ? ` Notes: ${summarizeDiagnostics(result.diagnostics)}.`
       : "";
@@ -428,9 +453,9 @@ export function UpdateCenter() {
     setMessage(
       `Scanned ${result.scanned ?? 0} of ${eligibleCount} eligible ${activeEntityLabel}s from ${
         selectedCount
-      } selected, checked ${result.sourceCount ?? 0} sources, and created ${
+      } selected, checked ${result.sourceCount ?? 0} ${sourceLabel}, and created ${
         result.created ?? 0
-      } suggestions. Max ${runLimit} per run.${minimumDealYearText}${skippedPendingText}${diagnosticText}${providerText}${providerErrorText}`
+      } suggestions. Max ${runLimit} per run.${researchModeText}${minimumDealYearText}${skippedPendingText}${diagnosticText}${providerText}${providerErrorText}`
     );
   }
 
@@ -592,19 +617,19 @@ export function UpdateCenter() {
                       <h2>{activeWorkflow.label}</h2>
                       <p className="cadence-note">{activeWorkflow.cadence}</p>
                     </div>
-                    {activeWorkflow.key === "deal-team" ? (
+                    {activeWorkflow.key === "deal-team" || activeWorkflow.key === "ccd-deal-team" ? (
                       <ol className="research-flow" aria-label="Deal research flow">
                         <li>
-                          <span>1</span>Find deal candidates
+                          <span>1</span>Use Last Deal/CDIAC
                         </li>
                         <li>
-                          <span>2</span>Rank sources
+                          <span>2</span>Open DebtWatch report
                         </li>
                         <li>
-                          <span>3</span>Read PDF/pages
+                          <span>3</span>Read report roles
                         </li>
                         <li>
-                          <span>4</span>Extract package
+                          <span>4</span>Suggest package
                         </li>
                         <li>
                           <span>5</span>Review

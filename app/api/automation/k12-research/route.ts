@@ -5,7 +5,8 @@ import {
   getOpenAIApiKey,
   getOpenAIModel,
   getPerplexityApiKey,
-  getPerplexityModel
+  getPerplexityModel,
+  isDealTeamWebFallbackEnabled
 } from "@/lib/supabase/config";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 
@@ -42,6 +43,9 @@ const maxDealTeamSourceCandidateDiagnostics = 100;
 const defaultBatchLimit = 100;
 const minimumDealYear = 2023;
 const preferredDealYear = 2025;
+const debtWatchApiBaseUrl = "https://debtwatch.treasurer.ca.gov/api";
+const debtWatchIssueDetailBaseUrl = "https://debtwatch.treasurer.ca.gov/issue-level-detail/issues";
+const debtWatchIssueSearchPageSize = 8;
 
 const blockedSourceHosts = [
   "ballotpedia.org",
@@ -57,7 +61,7 @@ const blockedSourceHosts = [
   "youtube.com"
 ];
 
-type SourceProfile = "authorization" | "ccd-leadership" | "deal-team" | "k12-leadership";
+type SourceProfile = "authorization" | "ccd-leadership" | "deal-team" | "k12-leadership" | "last-deal";
 
 type WorkflowConfig = {
   fields: readonly string[];
@@ -69,14 +73,29 @@ type WorkflowConfig = {
   sourceProfile: SourceProfile;
 };
 
-type WorkflowKey = "authorization" | "ccd-leadership" | "deal-team" | "leadership";
+type WorkflowKey =
+  | "authorization"
+  | "ccd-deal-facts"
+  | "ccd-deal-team"
+  | "ccd-leadership"
+  | "deal-team"
+  | "last-deal"
+  | "leadership";
 
 const workflows: Record<WorkflowKey, WorkflowConfig> = {
-  "deal-team": {
-    fields: ["Last Deal", "MA", "UW", "BC"],
+  "last-deal": {
+    fields: ["Last Deal"],
     module: "k12-targets",
     prompt:
-      "Extract the newest clearly supported bond/debt transaction from 2023 or later for the exact school district or a CFD/SFID/special-tax financing explicitly named for or sponsored by that district, and extract the deal team as one deal package. Prefer 2025/2026 transactions over complete but older 2023/2024 official statements. MA means Municipal Advisor, UW means Underwriter, and BC means Bond Counsel. Do not use unrelated city, county, redevelopment, overlapping-agency, private-school, or similarly named CFD transactions. Underwriter must be an investment bank/dealer, not a law firm or counsel. Bond Counsel must be explicitly labeled bond counsel, not disclosure counsel. Follow this source path: first use EMMA/Official Statement/POS/bond PDFs when reachable; next use CDIAC/DebtWatch to discover or confirm deal records; next use official district board agenda packets, minutes, staff reports, and resolutions to confirm financing team, authorization, refunding, or sale approval; then use BondLink, MuniOS, and public-finance transaction pages as supporting sources. Do not treat EMMA as the only path because the public EMMA website may not be server-readable. Use stale rating/news/search snippets only as hints, not as final support. If no 2023-or-newer transaction is supported, omit all deal-team fields.",
+      "Use the local CDIAC/DebtWatch deal-facts dataset to propose only the latest supported bond/debt transaction for the exact school district or a CFD/SFID/special-tax financing explicitly named for or sponsored by that district. Do not extract MA, UW, BC, or other deal-team roles in this workflow.",
+    queries: k12DealTeamQueries,
+    sourceProfile: "last-deal"
+  },
+  "deal-team": {
+    fields: ["MA", "UW", "BC"],
+    module: "k12-targets",
+    prompt:
+      "Extract only the deal-team roles for the newest clearly supported bond/debt transaction from 2023 or later for the exact school district or a CFD/SFID/special-tax financing explicitly named for or sponsored by that district. MA means Municipal Advisor, UW means Underwriter, and BC means Bond Counsel. Do not propose Last Deal in this workflow. Do not use unrelated city, county, redevelopment, overlapping-agency, private-school, or similarly named CFD transactions. Underwriter must be an investment bank/dealer, not a law firm or counsel. Bond Counsel must be explicitly labeled bond counsel, not disclosure counsel. Follow this source path: first use EMMA/Official Statement/POS/bond PDFs when reachable; next use CDIAC/DebtWatch to discover or confirm deal records; next use official district board agenda packets, minutes, staff reports, and resolutions to confirm financing team, authorization, refunding, or sale approval; then use BondLink, MuniOS, and public-finance transaction pages as supporting sources. Do not treat EMMA as the only path because the public EMMA website may not be server-readable. Use stale rating/news/search snippets only as hints, not as final support. If no role is directly supported, omit it.",
     queries: k12DealTeamQueries,
     sourceProfile: "deal-team"
   },
@@ -102,6 +121,22 @@ const workflows: Record<WorkflowKey, WorkflowConfig> = {
     ],
     sourceProfile: "authorization"
   },
+  "ccd-deal-facts": {
+    fields: ["Last Deal"],
+    module: "ccd-targets",
+    prompt:
+      "Use the local CDIAC/DebtWatch deal-facts dataset to propose only the latest supported bond/debt transaction for the exact California community college district. Do not extract Underwriter, MA, BC, Chancellor, CFO, or other roles in this workflow.",
+    queries: ccdDealTeamQueries,
+    sourceProfile: "last-deal"
+  },
+  "ccd-deal-team": {
+    fields: ["Underwriter", "MA", "BC"],
+    module: "ccd-targets",
+    prompt:
+      "Extract only the deal-team roles for the newest clearly supported bond/debt transaction from 2023 or later for the exact California community college district. Underwriter means Lead Underwriter or senior manager, MA means Municipal Advisor or Financial/Municipal Advisor, and BC means Bond Counsel. Do not propose Last Deal in this workflow. Prefer CDIAC/DebtWatch Reports Section for a selected CDIAC number; if web/model fallback is explicitly enabled, use EMMA/Official Statement/POS/bond PDFs, official district board agenda packets, staff reports, resolutions, BondLink, and MuniOS only as supporting sources. If no role is directly supported, omit it.",
+    queries: ccdDealTeamQueries,
+    sourceProfile: "deal-team"
+  },
   "ccd-leadership": {
     fields: ["Chancellor", "CFO"],
     module: "ccd-targets",
@@ -112,6 +147,10 @@ const workflows: Record<WorkflowKey, WorkflowConfig> = {
     sourceProfile: "ccd-leadership"
   }
 };
+
+function valueFieldsForWorkflow(workflowKey: WorkflowKey, fields: readonly string[]) {
+  return workflows[workflowKey].sourceProfile === "deal-team" ? uniqueStrings([...fields, "Last Deal"]) : [...fields];
+}
 
 function k12DealTeamQueries(district: string) {
   const aliases = k12SearchAliases(district);
@@ -201,6 +240,46 @@ function k12DealTeamQueries(district: string) {
     ...authorizationRefundingQueries,
     ...transactionPageQueries,
     ...yearQueries,
+    ...domainQueries,
+    ...aliasQueries
+  ]).slice(0, maxDealTeamQueries);
+}
+
+function ccdDealTeamQueries(target: string) {
+  const aliases = ccdSearchAliases(target);
+  const domains = ccdSearchDomains(target);
+  const primaryAlias = aliases[0] ?? target;
+  const years = ["2026", "2025", "2024", "2023"];
+  const officialStatementQueries = [
+    `${primaryAlias} EMMA official statement community college district bonds 2026 2025 2024 2023`,
+    `${primaryAlias} OS POS PDF official statement bonds municipal advisor underwriter bond counsel`,
+    `${primaryAlias} CDIAC DebtWatch community college district bonds underwriter municipal advisor bond counsel`,
+    `${primaryAlias} latest bond issue CDIAC number DebtWatch`
+  ];
+  const boardMaterialQueries = [
+    `${primaryAlias} board agenda bonds 2025 2024 2023 municipal advisor underwriter bond counsel`,
+    `${primaryAlias} board minutes bonds financing team municipal advisor underwriter bond counsel`,
+    `${primaryAlias} bond purchase agreement municipal advisor underwriter bond counsel`
+  ];
+  const domainQueries = domains.flatMap((domain) => [
+    `site:${domain} official statement bonds municipal advisor underwriter bond counsel`,
+    `site:${domain} board agenda bonds financing team`,
+    `site:${domain} bond purchase agreement underwriter municipal advisor`
+  ]);
+  const aliasQueries = aliases.flatMap((alias) => [
+    `"${alias}" "Official Statement" "Community College District"`,
+    `"${alias}" "CDIAC" "Underwriter"`,
+    `"${alias}" "Bond Counsel" "Municipal Advisor"`,
+    `"${alias}" "Financial Advisor" "Underwriter"`,
+    ...years.flatMap((year) => [
+      `"${alias}" "${year}" "Official Statement" "Underwriter"`,
+      `"${alias}" "${year}" "Bond Counsel" "Municipal Advisor"`
+    ])
+  ]);
+
+  return uniqueStrings([
+    ...officialStatementQueries,
+    ...boardMaterialQueries,
     ...domainQueries,
     ...aliasQueries
   ]).slice(0, maxDealTeamQueries);
@@ -693,6 +772,33 @@ type MuniDealFactRow = {
   uw?: string | null;
 };
 
+type DebtWatchIssueRecord = Record<string, unknown> & {
+  BondCounsel?: string | null;
+  CDIACNumber?: string | null;
+  DebtType?: string | null;
+  FinancialOrMunicipalAdvisor?: string | null;
+  IssueName?: string | null;
+  Issuer?: string | null;
+  LeadUnderwriter?: string | null;
+  PrincipalAmount?: number | string | null;
+  ProjectSeriesOrName?: string | null;
+  RefundingAmount?: number | string | null;
+  SaleDate?: string | null;
+};
+
+type DebtWatchIssuanceDetailResponse = {
+  datasetById?: {
+    issues?: {
+      record?: DebtWatchIssueRecord;
+    };
+  };
+};
+
+type DebtWatchIssueSearchResponse = {
+  records?: DebtWatchIssueRecord[];
+  totalMatchingRecords?: number;
+};
+
 type BoardRosterMember = AutomationFieldResult & {
   normalizedValue: string;
   value: string;
@@ -700,22 +806,13 @@ type BoardRosterMember = AutomationFieldResult & {
 
 export async function POST(request: Request) {
   const sourceSearchConfigs = getSourceSearchConfigs();
-  let extractors: ExtractorConfig[];
+  let extractorConfigError = "";
+  let extractors: ExtractorConfig[] = [];
 
   try {
     extractors = getExtractorConfigs();
   } catch (error) {
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : "Extraction provider is not configured." },
-      { status: 503 }
-    );
-  }
-
-  if (!sourceSearchConfigs.length) {
-    return NextResponse.json(
-      { error: "Add OPENAI_API_KEY or PERPLEXITY_API_KEY in Vercel to run source search." },
-      { status: 503 }
-    );
+    extractorConfigError = error instanceof Error ? error.message : "Extraction provider is not configured.";
   }
 
   const supabase = await createSupabaseServerClient();
@@ -744,6 +841,19 @@ export async function POST(request: Request) {
     );
   }
 
+  if (workflow.sourceProfile !== "last-deal" && workflow.sourceProfile !== "deal-team") {
+    if (extractorConfigError) {
+      return NextResponse.json({ error: extractorConfigError }, { status: 503 });
+    }
+
+    if (!sourceSearchConfigs.length) {
+      return NextResponse.json(
+        { error: "Add OPENAI_API_KEY or PERPLEXITY_API_KEY in Vercel to run source search." },
+        { status: 503 }
+      );
+    }
+  }
+
   if (workflow.requiresConsensus && extractors.length < minimumConsensusVotes) {
     return NextResponse.json(
       { error: `${workflowKey} research requires at least two extraction providers for consensus.` },
@@ -769,6 +879,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: `No matching ${entityLabel(moduleKey)}s were found.` }, { status: 400 });
   }
 
+  const valueFieldKeys = valueFieldsForWorkflow(workflowKey, workflow.fields);
   const [{ data: savedValues, error: valuesError }, { data: pendingSuggestions, error: pendingError }] =
     await Promise.all([
       supabase
@@ -776,7 +887,7 @@ export async function POST(request: Request) {
         .select("record_id, field_key, value")
         .eq("module", moduleKey)
         .in("record_id", rowIds)
-        .in("field_key", workflow.fields),
+        .in("field_key", valueFieldKeys),
       supabase
         .from("update_suggestions")
         .select("record_id, field_key")
@@ -800,7 +911,7 @@ export async function POST(request: Request) {
     ])
   );
   rows.forEach((row) => {
-    workflow.fields.forEach((field) => {
+    valueFieldKeys.forEach((field) => {
       const key = `${row.id}::${field}`;
 
       if (!valueMap.has(key)) {
@@ -833,7 +944,8 @@ export async function POST(request: Request) {
         extractors,
         supabase,
         moduleKey,
-        row.id
+        row.id,
+        valueMap.get(`${row.id}::Last Deal`) ?? ""
       );
       sourceCount += result.source_count ?? 0;
       if (result.source_candidates?.length) {
@@ -899,9 +1011,11 @@ export async function POST(request: Request) {
 
   return NextResponse.json({
     ok: true,
+    dealTeamWebFallbackEnabled:
+      workflow.sourceProfile === "deal-team" ? isDealTeamWebFallbackEnabled() : null,
     extractors: extractors.map((extractor) => extractor.provider),
-    minimumDealYear: workflow.sourceProfile === "deal-team" ? minimumDealYear : null,
-    preferredDealYear: workflow.sourceProfile === "deal-team" ? preferredDealYear : null,
+    minimumDealYear: isDealWorkflow(workflowKey) ? minimumDealYear : null,
+    preferredDealYear: isDealWorkflow(workflowKey) ? preferredDealYear : null,
     module: moduleKey,
     workflow: workflowKey,
     limit,
@@ -925,15 +1039,68 @@ async function researchInstitution(
   extractors: ExtractorConfig[],
   supabase: SupabaseServerClient,
   moduleKey: ModuleKey,
-  recordId: string
+  recordId: string,
+  savedLastDeal: string
 ): Promise<AutomationResearchResult> {
-  const l1DealResult =
-    workflows[workflowKey].sourceProfile === "deal-team"
+  const sourceProfile = workflows[workflowKey].sourceProfile;
+
+  if (sourceProfile === "last-deal") {
+    const l1DealResult = await researchDealTeamFromL1(supabase, moduleKey, recordId, institution);
+
+    return (
+      l1DealResult ?? {
+        candidate_diagnostics: [`No CDIAC/DebtWatch deal fact is loaded for ${institution}.`],
+        fields: [],
+        source_count: 0
+      }
+    );
+  }
+
+  let l1DealResult =
+    sourceProfile === "deal-team"
       ? await researchDealTeamFromL1(supabase, moduleKey, recordId, institution)
       : null;
 
-  if (l1DealResult && hasCompleteDealTeamPackage(l1DealResult)) {
+  if (sourceProfile === "deal-team" && (!l1DealResult || !hasCompleteDealTeamPackage(workflowKey, l1DealResult))) {
+    const debtWatchLastDealResult = await researchDealTeamFromDebtWatchLastDeal(
+      moduleKey,
+      institution,
+      savedLastDeal
+    );
+
+    if (debtWatchLastDealResult) {
+      l1DealResult = l1DealResult
+        ? mergeL1AndSearchDealResults(l1DealResult, debtWatchLastDealResult, workflowKey)
+        : debtWatchLastDealResult;
+    }
+  }
+
+  if (l1DealResult && hasCompleteDealTeamPackage(workflowKey, l1DealResult)) {
     return l1DealResult;
+  }
+
+  if (sourceProfile === "deal-team" && !isDealTeamWebFallbackEnabled()) {
+    return {
+      ...(l1DealResult ?? { fields: [], source_count: 0 }),
+      candidate_diagnostics: mergeCandidateDiagnostics([
+        ...(l1DealResult?.candidate_diagnostics ?? []),
+        l1DealResult
+          ? `CDIAC-only mode: L1/DebtWatch did not contain a complete ${dealTeamFieldList(workflowKey)} package, and web/model fallback is disabled by default.`
+          : `CDIAC-only mode: no complete CDIAC/DebtWatch deal fact was found for ${institution}; web/model fallback is disabled by default.`
+      ])
+    };
+  }
+
+  if (!sourceSearchConfigs.length || !extractors.length) {
+    return {
+      ...(l1DealResult ?? { fields: [], source_count: 0 }),
+      candidate_diagnostics: mergeCandidateDiagnostics([
+        ...(l1DealResult?.candidate_diagnostics ?? []),
+        l1DealResult
+          ? `L1 CDIAC/DebtWatch data did not contain a complete ${dealTeamFieldList(workflowKey)} package; source-search/extraction fallback is not fully configured.`
+          : `No complete CDIAC/DebtWatch deal fact is loaded for ${institution}; source-search/extraction fallback is not fully configured.`
+      ])
+    };
   }
 
   const searchResult = await researchInstitutionFromSources(
@@ -947,7 +1114,7 @@ async function researchInstitution(
     return searchResult;
   }
 
-  return mergeL1AndSearchDealResults(l1DealResult, searchResult);
+  return mergeL1AndSearchDealResults(l1DealResult, searchResult, workflowKey);
 }
 
 async function researchInstitutionFromSources(
@@ -994,7 +1161,7 @@ async function researchInstitutionFromSources(
 
   if (workflow.sourceProfile === "deal-team" && extractors.length > 1) {
     const initialResult = await runDealTeamExtraction(input, extractors, sources);
-    const followUpQueries = dealFollowUpQueries(institution, initialResult);
+    const followUpQueries = dealFollowUpQueries(institution, initialResult, workflowKey);
 
     if (!followUpQueries.length) {
       return {
@@ -1037,7 +1204,7 @@ async function researchInstitutionFromSources(
       sourceList: buildSourceList(combinedSources)
     };
     const followUpResult = await runDealTeamExtraction(combinedInput, extractors, combinedSources);
-    const result = mergeDealTeamResearchResults(initialResult, followUpResult);
+    const result = mergeDealTeamResearchResults(initialResult, followUpResult, workflow.fields);
 
     return {
       ...result,
@@ -1077,33 +1244,33 @@ async function researchDealTeamFromL1(
   recordId: string,
   institution: string
 ): Promise<AutomationResearchResult | null> {
+  const selectColumns = [
+    "auth_detail",
+    "auth_type",
+    "bc",
+    "bond_counsel",
+    "confidence",
+    "deal_name",
+    "deal_par_amount",
+    "deal_sale_date",
+    "deal_state_id",
+    "deal_type",
+    "issuer_name_reported",
+    "ma",
+    "municipal_advisor",
+    "related_entity_name",
+    "refunding_type",
+    "source_excerpt",
+    "source_layer",
+    "source_title_primary",
+    "source_url_primary",
+    "underwriters",
+    "uw"
+  ].join(", ");
+
   const { data, error } = await supabase
     .from("muni_deal_facts")
-    .select(
-      [
-        "auth_detail",
-        "auth_type",
-        "bc",
-        "bond_counsel",
-        "confidence",
-        "deal_name",
-        "deal_par_amount",
-        "deal_sale_date",
-        "deal_state_id",
-        "deal_type",
-        "issuer_name_reported",
-        "ma",
-        "municipal_advisor",
-        "related_entity_name",
-        "refunding_type",
-        "source_excerpt",
-        "source_layer",
-        "source_title_primary",
-        "source_url_primary",
-        "underwriters",
-        "uw"
-      ].join(", ")
-    )
+    .select(selectColumns)
     .eq("module", moduleKey)
     .eq("record_id", recordId)
     .eq("scope_included", true)
@@ -1124,12 +1291,15 @@ async function researchDealTeamFromL1(
   }
 
   const rows = (data ?? []) as MuniDealFactRow[];
+  const candidateRows = rows.length
+    ? rows
+    : await researchDealTeamFromL1ByInstitution(supabase, moduleKey, institution, selectColumns);
 
-  if (!rows.length) {
+  if (!candidateRows.length) {
     return null;
   }
 
-  const latestRows = latestSameDayDeals(rows);
+  const latestRows = latestSameDayDeals(candidateRows);
   const latestDeal = latestRows[0];
 
   if (!latestDeal) {
@@ -1147,27 +1317,431 @@ async function researchDealTeamFromL1(
     };
   }
 
-  const fields = buildL1DealFields(latestDeal);
+  const enrichedLatestDeal = await enrichL1DealFromDebtWatch(latestDeal);
+  const fields = buildL1DealFields(enrichedLatestDeal, moduleKey);
 
   if (!fields.length) {
     return null;
   }
 
   return {
-    candidate_diagnostics: [`L1 state filing deal found for ${institution}: ${formatL1DealSummary(latestDeal)}.`],
+    candidate_diagnostics: [`L1 state filing deal found for ${institution}: ${formatL1DealSummary(enrichedLatestDeal)}.`],
     deal_follow_up_seeds: [
       {
-        confidence: l1Confidence(latestDeal),
-        excerpt: l1EvidenceExcerpt(latestDeal),
-        source_title: l1SourceTitle(latestDeal),
-        source_url: l1SourceUrl(latestDeal),
-        value: formatL1DealSummary(latestDeal)
+        confidence: l1Confidence(enrichedLatestDeal),
+        excerpt: l1EvidenceExcerpt(enrichedLatestDeal),
+        source_title: l1SourceTitle(enrichedLatestDeal),
+        source_url: l1SourceUrl(enrichedLatestDeal),
+        value: formatL1DealSummary(enrichedLatestDeal)
       }
     ],
     fields,
-    source_candidates: [l1SourceCandidate(latestDeal, institution)],
+    source_candidates: [l1SourceCandidate(enrichedLatestDeal, institution)],
     source_count: 1
   };
+}
+
+async function enrichL1DealFromDebtWatch(row: MuniDealFactRow): Promise<MuniDealFactRow> {
+  const cdiacNumber = cleanL1Value(row.deal_state_id);
+
+  if (!cdiacNumber) {
+    return row;
+  }
+
+  const issueRecord = await fetchDebtWatchIssueRecord(cdiacNumber);
+
+  if (!issueRecord) {
+    return row;
+  }
+
+  return mergeDebtWatchIssueRecord(row, issueRecord, cdiacNumber);
+}
+
+async function researchDealTeamFromDebtWatchLastDeal(
+  moduleKey: ModuleKey,
+  institution: string,
+  savedLastDeal: string
+): Promise<AutomationResearchResult | null> {
+  const lastDeal = savedLastDeal.trim();
+
+  if (!lastDeal) {
+    return null;
+  }
+
+  const directCdiacNumber = extractCdiacNumbers(lastDeal)[0];
+  const directIssueRecord = directCdiacNumber ? await fetchDebtWatchIssueRecord(directCdiacNumber) : null;
+  const searchedIssueRecords = directIssueRecord
+    ? [directIssueRecord]
+    : await searchDebtWatchIssuesForLastDeal(institution, lastDeal);
+  const bestIssueRecord = chooseDebtWatchIssueRecord(searchedIssueRecords, institution, lastDeal);
+  const cdiacNumber = debtWatchText(bestIssueRecord?.CDIACNumber);
+
+  if (!bestIssueRecord || !cdiacNumber) {
+    return null;
+  }
+
+  const deal = mergeDebtWatchIssueRecord(debtWatchIssueRecordToMuniDealFact(bestIssueRecord), bestIssueRecord, cdiacNumber);
+  const fields = buildL1DealFields(deal, moduleKey);
+
+  if (!fields.length) {
+    return null;
+  }
+
+  return {
+    candidate_diagnostics: [
+      `DebtWatch issue search matched saved Last Deal for ${institution} to CDIAC ${cdiacNumber}: ${formatL1DealSummary(deal)}.`
+    ],
+    deal_follow_up_seeds: [
+      {
+        confidence: l1Confidence(deal),
+        excerpt: l1EvidenceExcerpt(deal),
+        source_title: l1SourceTitle(deal),
+        source_url: l1SourceUrl(deal),
+        value: formatL1DealSummary(deal)
+      }
+    ],
+    fields,
+    source_candidates: [l1SourceCandidate(deal, institution)],
+    source_count: searchedIssueRecords.length
+  };
+}
+
+function debtWatchIssueRecordToMuniDealFact(issueRecord: DebtWatchIssueRecord): MuniDealFactRow {
+  return {
+    confidence: "high",
+    deal_name: firstString(issueRecord.IssueName, issueRecord.ProjectSeriesOrName),
+    deal_par_amount: debtWatchNumber(issueRecord.PrincipalAmount),
+    deal_sale_date: debtWatchDate(issueRecord.SaleDate),
+    deal_state_id: debtWatchText(issueRecord.CDIACNumber),
+    deal_type: debtWatchText(issueRecord.DebtType),
+    issuer_name_reported: debtWatchText(issueRecord.Issuer),
+    source_layer: "L1"
+  };
+}
+
+async function searchDebtWatchIssuesForLastDeal(institution: string, lastDeal: string) {
+  const queries = debtWatchIssueSearchQueries(institution, lastDeal);
+  const settledResults = await Promise.allSettled(queries.map(searchDebtWatchIssues));
+  const issueByCdiacNumber = new Map<string, DebtWatchIssueRecord>();
+
+  settledResults.forEach((result) => {
+    if (result.status !== "fulfilled") {
+      return;
+    }
+
+    result.value.forEach((record) => {
+      const cdiacNumber = debtWatchText(record.CDIACNumber);
+
+      if (cdiacNumber) {
+        issueByCdiacNumber.set(cdiacNumber, record);
+      }
+    });
+  });
+
+  return Array.from(issueByCdiacNumber.values());
+}
+
+function debtWatchIssueSearchQueries(institution: string, lastDeal: string) {
+  const cleanedLastDeal = lastDealSearchPhrase(lastDeal);
+
+  return uniqueStrings([
+    ...extractCdiacNumbers(lastDeal),
+    ...extractDealSeriesLabels(lastDeal),
+    ...extractCfdLabels(lastDeal),
+    ...dealFollowUpDealTerms(lastDeal),
+    cleanedLastDeal,
+    `${institution} ${cleanedLastDeal}`.trim()
+  ])
+    .filter((query) => query.length >= 4)
+    .slice(0, 8);
+}
+
+async function searchDebtWatchIssues(query: string) {
+  try {
+    const response = await fetch(`${debtWatchApiBaseUrl}/dataset/issues/search`, {
+      body: JSON.stringify({
+        filters: {},
+        pagination: {
+          pageNumber: 1,
+          pageSize: debtWatchIssueSearchPageSize
+        },
+        searchTerm: query,
+        sorting: {
+          ascending: false,
+          columnId: "CDIACNumber"
+        }
+      }),
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+        "user-agent": "Mozilla/5.0 (compatible; K12TargetsResearch/1.0)"
+      },
+      method: "PUT",
+      signal: AbortSignal.timeout(sourceFetchTimeoutMs)
+    });
+
+    if (!response.ok) {
+      return [];
+    }
+
+    const data = (await response.json()) as DebtWatchIssueSearchResponse;
+
+    return Array.isArray(data.records) ? data.records : [];
+  } catch {
+    return [];
+  }
+}
+
+function chooseDebtWatchIssueRecord(
+  issueRecords: DebtWatchIssueRecord[],
+  institution: string,
+  lastDeal: string
+) {
+  return issueRecords
+    .map((record) => ({
+      record,
+      score: scoreDebtWatchIssueRecord(record, institution, lastDeal)
+    }))
+    .filter((candidate) => candidate.score >= 35)
+    .sort((left, right) => right.score - left.score)[0]?.record ?? null;
+}
+
+function scoreDebtWatchIssueRecord(
+  issueRecord: DebtWatchIssueRecord,
+  institution: string,
+  lastDeal: string
+) {
+  const cdiacNumber = debtWatchText(issueRecord.CDIACNumber);
+  const normalizedEvidence = normalizeIdentityText(
+    [
+      issueRecord.Issuer,
+      issueRecord.IssueName,
+      issueRecord.ProjectSeriesOrName,
+      issueRecord.DebtType
+    ]
+      .filter(Boolean)
+      .join(" ")
+  );
+  const institutionMatch = dealEvidenceMentionsInstitution(normalizedEvidence, institution);
+  const directCdiacMatch = cdiacNumber ? extractCdiacNumbers(lastDeal).includes(cdiacNumber) : false;
+
+  if (!institutionMatch && !directCdiacMatch) {
+    return 0;
+  }
+
+  const saleYear = Number(debtWatchDate(issueRecord.SaleDate)?.slice(0, 4));
+  const lastDealYears = extractYears(lastDeal);
+  const issueAmount = debtWatchNumber(issueRecord.PrincipalAmount);
+  const lastDealAmounts = extractDealAmountNumbers(lastDeal);
+  const normalizedIssueText = normalizeIdentityText(
+    [issueRecord.IssueName, issueRecord.ProjectSeriesOrName, issueRecord.DebtType].filter(Boolean).join(" ")
+  );
+  const matchingSeriesLabels = extractDealSeriesLabels(lastDeal).filter((label) =>
+    normalizedIssueText.includes(normalizeIdentityText(label))
+  ).length;
+  const matchingCfdLabels = extractCfdLabels(lastDeal).filter((label) =>
+    normalizedIssueText.includes(normalizeIdentityText(label))
+  ).length;
+  const matchingDealTerms = dealFollowUpDealTerms(lastDeal).filter((term) =>
+    normalizedIssueText.includes(normalizeIdentityText(term))
+  ).length;
+  const amountMatch = issueAmount !== null && lastDealAmounts.some((amount) => amountsAreClose(issueAmount, amount));
+
+  return (
+    (directCdiacMatch ? 100 : 0) +
+    (institutionMatch ? 35 : 0) +
+    (Number.isFinite(saleYear) && lastDealYears.includes(saleYear) ? 20 : 0) +
+    (amountMatch ? 25 : 0) +
+    matchingSeriesLabels * 18 +
+    matchingCfdLabels * 20 +
+    matchingDealTerms * 8
+  );
+}
+
+function extractCdiacNumbers(value: string) {
+  return uniqueStrings(Array.from(value.matchAll(/\b20\d{2}-\d{4}\b/g)).map((match) => match[0]));
+}
+
+function lastDealSearchPhrase(value: string) {
+  return value
+    .replace(/\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?\s+20\d{2}\b/gi, " ")
+    .replace(/\$\s?\d+(?:\.\d+)?\s?(?:m|mm|million)?/gi, " ")
+    .replace(/\b\d+(?:\.\d+)?\s?(?:m|mm|million)\b/gi, " ")
+    .replace(/[-–—|:,]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function extractDealAmountNumbers(value: string) {
+  return Array.from(value.matchAll(/\$\s?(\d+(?:\.\d+)?)\s?(m|mm|million)?/gi))
+    .map((match) => {
+      const amount = Number(match[1]);
+
+      if (!Number.isFinite(amount)) {
+        return null;
+      }
+
+      return match[2] ? amount * 1_000_000 : amount;
+    })
+    .filter((amount): amount is number => amount !== null);
+}
+
+function amountsAreClose(left: number, right: number) {
+  const denominator = Math.max(Math.abs(left), Math.abs(right), 1);
+
+  return Math.abs(left - right) / denominator <= 0.02;
+}
+
+async function fetchDebtWatchIssueRecord(cdiacNumber: string) {
+  try {
+    const response = await fetch(
+      `${debtWatchApiBaseUrl}/report/issuance-detail-with-history/${encodeURIComponent(cdiacNumber)}`,
+      {
+        headers: {
+          accept: "application/json",
+          "user-agent": "Mozilla/5.0 (compatible; K12TargetsResearch/1.0)"
+        },
+        signal: AbortSignal.timeout(sourceFetchTimeoutMs)
+      }
+    );
+
+    if (!response.ok) {
+      return null;
+    }
+
+    const data = (await response.json()) as DebtWatchIssuanceDetailResponse;
+
+    return data.datasetById?.issues?.record ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function mergeDebtWatchIssueRecord(
+  row: MuniDealFactRow,
+  issueRecord: DebtWatchIssueRecord,
+  cdiacNumber: string
+): MuniDealFactRow {
+  const reportedCdiacNumber = debtWatchText(issueRecord.CDIACNumber) ?? cdiacNumber;
+  const reportedMa = debtWatchText(issueRecord.FinancialOrMunicipalAdvisor);
+  const reportedUw = debtWatchText(issueRecord.LeadUnderwriter);
+  const reportedBc = debtWatchText(issueRecord.BondCounsel);
+  const reportedSaleDate = debtWatchDate(issueRecord.SaleDate);
+  const reportedParAmount = debtWatchNumber(issueRecord.PrincipalAmount);
+  const merged: MuniDealFactRow = {
+    ...row,
+    bc: reportedBc ?? row.bc,
+    bond_counsel: reportedBc ?? row.bond_counsel,
+    deal_name: firstString(issueRecord.IssueName, issueRecord.ProjectSeriesOrName, row.deal_name),
+    deal_par_amount: row.deal_par_amount ?? reportedParAmount,
+    deal_sale_date: row.deal_sale_date ?? reportedSaleDate,
+    deal_state_id: row.deal_state_id ?? reportedCdiacNumber,
+    deal_type: row.deal_type ?? debtWatchText(issueRecord.DebtType),
+    issuer_name_reported: firstString(row.issuer_name_reported, issueRecord.Issuer),
+    ma: reportedMa ?? row.ma,
+    municipal_advisor: reportedMa ?? row.municipal_advisor,
+    source_layer: row.source_layer ?? "L1",
+    source_title_primary: `CDIAC DebtWatch report ${reportedCdiacNumber}`,
+    source_url_primary: debtWatchIssueReportUrl(reportedCdiacNumber),
+    underwriters: reportedUw ? [{ name: reportedUw }] : row.underwriters,
+    uw: reportedUw ?? row.uw
+  };
+
+  return {
+    ...merged,
+    source_excerpt: debtWatchIssueEvidenceExcerpt(merged)
+  };
+}
+
+function debtWatchText(value: unknown) {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function debtWatchDate(value: unknown) {
+  const text = debtWatchText(value);
+
+  return text ? text.slice(0, 10) : null;
+}
+
+function debtWatchNumber(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const numberValue = Number(value.replace(/[$,]/g, "").trim());
+
+  return Number.isFinite(numberValue) ? numberValue : null;
+}
+
+function debtWatchIssueReportUrl(cdiacNumber: string) {
+  return `${debtWatchIssueDetailBaseUrl}?cdiacNumber=${encodeURIComponent(cdiacNumber)}`;
+}
+
+function debtWatchIssueEvidenceExcerpt(row: MuniDealFactRow) {
+  const ma = firstL1Value(row.ma, row.municipal_advisor);
+  const uw = firstL1Value(row.uw) ?? formatUnderwriters(row.underwriters);
+  const bc = firstL1Value(row.bc, row.bond_counsel);
+
+  return [
+    "CDIAC DebtWatch Reports Section",
+    row.deal_state_id ? `CDIAC Number: ${row.deal_state_id}` : "",
+    firstL1Value(row.issuer_name_reported) ? `Reported issuer: ${firstL1Value(row.issuer_name_reported)}` : "",
+    firstL1Value(row.deal_name) ? `Issue name: ${firstL1Value(row.deal_name)}` : "",
+    row.deal_sale_date ? `Sale date: ${row.deal_sale_date}` : "",
+    row.deal_par_amount ? `Par: ${formatParAmount(row.deal_par_amount)}` : "",
+    uw ? `Lead Underwriter: ${uw}` : "",
+    ma ? `Financial/Municipal Advisor: ${ma}` : "",
+    bc ? `Bond Counsel: ${bc}` : ""
+  ]
+    .filter(Boolean)
+    .join("; ");
+}
+
+async function researchDealTeamFromL1ByInstitution(
+  supabase: SupabaseServerClient,
+  moduleKey: ModuleKey,
+  institution: string,
+  selectColumns: string
+) {
+  const { data, error } = await supabase
+    .from("muni_deal_facts")
+    .select(selectColumns)
+    .eq("module", moduleKey)
+    .eq("scope_included", true)
+    .gte("deal_sale_date", `${minimumDealYear}-01-01`)
+    .order("deal_sale_date", { ascending: false })
+    .limit(5000);
+
+  if (error) {
+    if (isMissingMuniPipelineTableError(error)) {
+      return [];
+    }
+
+    throw new Error(`L1 state filing issuer-name lookup failed: ${error.message}`);
+  }
+
+  return filterL1DealRowsForInstitution((data ?? []) as MuniDealFactRow[], institution);
+}
+
+function filterL1DealRowsForInstitution(rows: MuniDealFactRow[], institution: string) {
+  return rows.filter((row) => {
+    const normalizedEvidence = normalizeIdentityText(
+      [
+        row.issuer_name_reported,
+        row.related_entity_name,
+        row.deal_name,
+        row.source_excerpt
+      ]
+        .filter(Boolean)
+        .join(" ")
+    );
+
+    return dealEvidenceMentionsInstitution(normalizedEvidence, institution);
+  });
 }
 
 function isMissingMuniPipelineTableError(error: { code?: string; message?: string }) {
@@ -1187,7 +1761,7 @@ function latestSameDayDeals(rows: MuniDealFactRow[]) {
   return sortedRows.filter((row) => row.deal_sale_date === latestSaleDate);
 }
 
-function buildL1DealFields(row: MuniDealFactRow): AutomationFieldResult[] {
+function buildL1DealFields(row: MuniDealFactRow, moduleKey: ModuleKey): AutomationFieldResult[] {
   const sourceTitle = l1SourceTitle(row);
   const sourceUrl = l1SourceUrl(row);
   const excerpt = l1EvidenceExcerpt(row);
@@ -1201,11 +1775,12 @@ function buildL1DealFields(row: MuniDealFactRow): AutomationFieldResult[] {
     source_title: sourceTitle,
     source_url: sourceUrl
   };
+  const underwriterFieldKey = moduleKey === "ccd-targets" ? "Underwriter" : "UW";
   const fieldValues: Array<[string, string | null]> = [
     ["Last Deal", formatL1DealSummary(row)],
-    ["MA", cleanL1Value(row.ma ?? row.municipal_advisor)],
-    ["UW", cleanL1Value(row.uw) ?? formatUnderwriters(row.underwriters)],
-    ["BC", cleanL1Value(row.bc ?? row.bond_counsel)]
+    ["MA", firstL1Value(row.ma, row.municipal_advisor)],
+    [underwriterFieldKey, firstL1Value(row.uw) ?? formatUnderwriters(row.underwriters)],
+    ["BC", firstL1Value(row.bc, row.bond_counsel)]
   ];
 
   return fieldValues.flatMap(([fieldKey, value]) => {
@@ -1308,6 +1883,18 @@ function cleanL1Value(value: string | null | undefined) {
   return normalizedValue && normalizedValue !== "-" ? normalizedValue : null;
 }
 
+function firstL1Value(...values: Array<string | null | undefined>) {
+  for (const value of values) {
+    const cleanedValue = cleanL1Value(value);
+
+    if (cleanedValue) {
+      return cleanedValue;
+    }
+  }
+
+  return null;
+}
+
 function l1SourceTitle(row: MuniDealFactRow) {
   const sourceLayer = row.source_layer?.trim() || "L1";
   const stateId = row.deal_state_id?.trim();
@@ -1351,13 +1938,13 @@ function l1EvidenceExcerpt(row: MuniDealFactRow) {
     row.deal_state_id ? `State ID: ${row.deal_state_id}` : "",
     row.deal_sale_date ? `Sale date: ${row.deal_sale_date}` : "",
     row.deal_par_amount ? `Par: ${formatParAmount(row.deal_par_amount)}` : "",
-    cleanL1Value(row.ma ?? row.municipal_advisor)
-      ? `Municipal Advisor: ${cleanL1Value(row.ma ?? row.municipal_advisor)}`
+    firstL1Value(row.ma, row.municipal_advisor)
+      ? `Municipal Advisor: ${firstL1Value(row.ma, row.municipal_advisor)}`
       : "",
-    cleanL1Value(row.uw) ?? formatUnderwriters(row.underwriters)
-      ? `Underwriter: ${cleanL1Value(row.uw) ?? formatUnderwriters(row.underwriters)}`
+    firstL1Value(row.uw) ?? formatUnderwriters(row.underwriters)
+      ? `Underwriter: ${firstL1Value(row.uw) ?? formatUnderwriters(row.underwriters)}`
       : "",
-    cleanL1Value(row.bc ?? row.bond_counsel) ? `Bond Counsel: ${cleanL1Value(row.bc ?? row.bond_counsel)}` : ""
+    firstL1Value(row.bc, row.bond_counsel) ? `Bond Counsel: ${firstL1Value(row.bc, row.bond_counsel)}` : ""
   ]
     .filter(Boolean)
     .join("; ");
@@ -1377,17 +1964,30 @@ function l1SourceCandidate(row: MuniDealFactRow, institution: string): SourceCan
   };
 }
 
-function hasCompleteDealTeamPackage(result: AutomationResearchResult) {
+function hasCompleteDealTeamPackage(workflowKey: WorkflowKey, result: AutomationResearchResult) {
   const fieldKeys = new Set((result.fields ?? []).map((field) => field.field_key));
 
-  return ["Last Deal", "MA", "UW", "BC"].every((fieldKey) => fieldKeys.has(fieldKey));
+  return dealTeamRoleFields(workflowKey).every((fieldKey) => fieldKeys.has(fieldKey));
+}
+
+function dealTeamRoleFields(workflowKey: WorkflowKey) {
+  return workflows[workflowKey].fields.filter((fieldKey) => fieldKey !== "Last Deal" && isDealTeamField(fieldKey));
+}
+
+function allDealTeamRoleFields() {
+  return ["MA", "UW", "Underwriter", "BC"];
+}
+
+function dealTeamFieldList(workflowKey: WorkflowKey) {
+  return dealTeamRoleFields(workflowKey).join("/");
 }
 
 function mergeL1AndSearchDealResults(
   l1Result: AutomationResearchResult,
-  searchResult: AutomationResearchResult
+  searchResult: AutomationResearchResult,
+  workflowKey: WorkflowKey
 ): AutomationResearchResult {
-  const merged = mergeDealTeamResearchResults(l1Result, searchResult);
+  const merged = mergeDealTeamResearchResults(l1Result, searchResult, dealTeamRoleFields(workflowKey));
 
   return {
     ...merged,
@@ -1410,7 +2010,7 @@ function buildSourceList(sources: SearchSource[]) {
     .join("\n\n");
 }
 
-function dealFollowUpQueries(institution: string, result: AutomationResearchResult) {
+function dealFollowUpQueries(institution: string, result: AutomationResearchResult, workflowKey: WorkflowKey) {
   const seeds = result.deal_follow_up_seeds?.length
     ? result.deal_follow_up_seeds
     : (result.fields ?? [])
@@ -1427,7 +2027,9 @@ function dealFollowUpQueries(institution: string, result: AutomationResearchResu
     return [];
   }
 
-  const aliases = k12SearchAliases(institution).slice(0, 4);
+  const aliases = (workflows[workflowKey].module === "ccd-targets"
+    ? ccdSearchAliases(institution)
+    : k12SearchAliases(institution)).slice(0, 4);
   const queries = seeds.flatMap((seed) => {
     const value = seed.value.trim();
     const sourceTitle = seed.source_title?.trim() ?? "";
@@ -1545,7 +2147,9 @@ function extractDealSeriesLabels(value: string) {
       ...Array.from(value.matchAll(/\b(?:series\s*)?20\d{2}[- ]?[A-Z]?\b/gi)).map((match) =>
         match[0].replace(/\s+/g, " ").trim()
       ),
-      ...Array.from(value.matchAll(/\bseries\s+[A-Z]\b/gi)).map((match) => match[0].replace(/\s+/g, " ").trim())
+      ...Array.from(value.matchAll(/\bseries\s+[0-9A-Z][0-9A-Z.-]*(?:\s+[A-Z][0-9A-Z.-]*)?\b/gi)).map((match) =>
+        match[0].replace(/\s+/g, " ").trim()
+      )
     ]
   ).slice(0, 4);
 }
@@ -1647,12 +2251,13 @@ function chooseBetterDealTeamResearchResult(
 
 function mergeDealTeamResearchResults(
   initialResult: AutomationResearchResult,
-  followUpResult: AutomationResearchResult
+  followUpResult: AutomationResearchResult,
+  allowedFields: readonly string[] = allDealTeamRoleFields()
 ): AutomationResearchResult {
   const bestResult = chooseBetterDealTeamResearchResult(initialResult, followUpResult);
   const mergedFields = bestDealFields(
     [...(initialResult.fields ?? []), ...(followUpResult.fields ?? [])],
-    workflows["deal-team"].fields
+    allowedFields
   );
   const mergedSeeds = mergeDealFollowUpSeeds([
     ...(initialResult.deal_follow_up_seeds ?? []),
@@ -1662,7 +2267,7 @@ function mergeDealTeamResearchResults(
   return {
     ...bestResult,
     deal_follow_up_seeds: mergedSeeds,
-    fields: mergedFields.length ? mergedFields : bestResult.fields
+    fields: mergedFields
   };
 }
 
@@ -1684,13 +2289,13 @@ function mergeDealFollowUpSeeds(seeds: DealFollowUpSeed[]) {
 function dealTeamResearchScore(result: AutomationResearchResult) {
   const fields = result.fields ?? [];
   const keys = new Set(fields.map((field) => field.field_key).filter(Boolean));
-  const participantCount = ["MA", "UW", "BC"].filter((fieldKey) => keys.has(fieldKey)).length;
+  const participantCount = allDealTeamRoleFields().filter((fieldKey) => keys.has(fieldKey)).length;
   const recencyScore = Math.max(0, ...fields.map(candidateDealYearScore));
   const averageConfidence =
     fields.reduce((sum, field) => sum + (normalizeConfidence(field.confidence) ?? 0), 0) /
     Math.max(fields.length, 1);
 
-  return recencyScore + fields.length * 20 + (keys.has("Last Deal") ? 12 : 0) + participantCount * 8 + averageConfidence;
+  return recencyScore + fields.length * 20 + participantCount * 8 + averageConfidence;
 }
 
 function dealTeamFollowUpDiagnostics(
@@ -1699,12 +2304,12 @@ function dealTeamFollowUpDiagnostics(
 ) {
   const initialKeys = new Set((initialResult.fields ?? []).map((field) => field.field_key));
   const followUpKeys = new Set((followUpResult.fields ?? []).map((field) => field.field_key));
-  const gainedFields = ["Last Deal", "MA", "UW", "BC"].filter(
+  const gainedFields = allDealTeamRoleFields().filter(
     (fieldKey) => followUpKeys.has(fieldKey) && !initialKeys.has(fieldKey)
   );
 
   if (!gainedFields.length) {
-    return ["Follow-up search ran, but did not find additional supported MA/UW/BC evidence."];
+    return ["Follow-up search ran, but did not find additional supported deal-team role evidence."];
   }
 
   return [`Follow-up search added supported field evidence for ${gainedFields.join(", ")}.`];
@@ -1936,13 +2541,16 @@ function sourceCandidateReason(
 
   if (sourceProfile === "k12-leadership" || sourceProfile === "deal-team") {
     const sourceHost = sourceHostName(source.url);
-    const domains = k12SearchDomains(institution);
+    const entityName = workflows[workflowKey].module === "ccd-targets" ? "CCD" : "district";
+    const domains = workflows[workflowKey].module === "ccd-targets"
+      ? ccdSearchDomains(institution)
+      : k12SearchDomains(institution);
 
     if (domains.length && !domains.some((domain) => sourceHost === domain || sourceHost.endsWith(`.${domain}`))) {
-      return "Excluded because the URL is outside known district domains and the text did not include an exact district alias.";
+      return `Excluded because the URL is outside known ${entityName} domains and the text did not include an exact ${entityName} alias.`;
     }
 
-    return "Excluded because the title/snippet/URL did not include an exact district alias.";
+    return `Excluded because the title/snippet/URL did not include an exact ${entityName} alias.`;
   }
 
   return "Excluded by source filtering.";
@@ -2081,8 +2689,13 @@ function shouldRunAssistantSourceSearch(workflowKey: WorkflowKey, mergedSources:
 
 function sourceSearchDomains(institution: string, workflowKey: WorkflowKey) {
   const sourceProfile = workflows[workflowKey].sourceProfile;
+  const moduleKey = workflows[workflowKey].module;
 
   if (sourceProfile === "ccd-leadership") {
+    return ccdSearchDomains(institution);
+  }
+
+  if (sourceProfile === "deal-team" && moduleKey === "ccd-targets") {
     return ccdSearchDomains(institution);
   }
 
@@ -2099,8 +2712,13 @@ function sourceSearchDomains(institution: string, workflowKey: WorkflowKey) {
 
 function filterSourcesForInstitution(sources: SearchSource[], institution: string, workflowKey: WorkflowKey) {
   const sourceProfile = workflows[workflowKey].sourceProfile;
+  const moduleKey = workflows[workflowKey].module;
 
   if (sourceProfile === "ccd-leadership") {
+    return sources.filter((source) => sourceMatchesCcdInstitution(source, institution));
+  }
+
+  if (sourceProfile === "deal-team" && moduleKey === "ccd-targets") {
     return sources.filter((source) => sourceMatchesCcdInstitution(source, institution));
   }
 
@@ -2250,8 +2868,7 @@ async function searchSourcesWithAnthropic(
 }
 
 function buildAssistantSourceSearchPrompt(institution: string, queries: string[], workflowKey: WorkflowKey) {
-  const sourceProfile = workflows[workflowKey].sourceProfile;
-  const profileInstruction = sourceSearchProfileInstruction(sourceProfile);
+  const profileInstruction = sourceSearchProfileInstruction(workflowKey);
 
   return `${profileInstruction}
 
@@ -2266,13 +2883,20 @@ Rules:
 - Return at most 10 high-quality sources.
 - Do not include LinkedIn, Wikipedia, Facebook, YouTube, or generic school ranking pages.
 - Use official/current sources when possible.
-- For deal-team research, use this path: find deal candidates, rank EMMA/OS/POS PDFs first, use CDIAC/DebtWatch for deal discovery, use district agenda/minutes/staff reports/resolutions for approval and role evidence, then use transaction pages/BondLink/MuniOS as support. Include sources likely to contain MA, underwriter, bond counsel, sale date, par amount, authorization, and new money/refunding details.
+- For deal-team research, use this path: find deal candidates, rank EMMA/OS/POS PDFs first, use CDIAC/DebtWatch for deal discovery, use official institution agenda/minutes/staff reports/resolutions for approval and role evidence, then use transaction pages/BondLink/MuniOS as support. Include sources likely to contain MA, underwriter, bond counsel, sale date, par amount, authorization, and new money/refunding details.
 - If no source is found, return {"sources":[]}.`;
 }
 
-function sourceSearchProfileInstruction(sourceProfile: SourceProfile) {
+function sourceSearchProfileInstruction(workflowKey: WorkflowKey) {
+  const workflow = workflows[workflowKey];
+  const sourceProfile = workflow.sourceProfile;
+
   if (sourceProfile === "ccd-leadership") {
     return "Find official current California community college district leadership source pages for Chancellor/President/Superintendent and CFO/equivalent finance executive. Prefer official district or college .edu pages, cabinet pages, administration pages, staff directories, organizational charts, and ACBO/CBO listings.";
+  }
+
+  if (sourceProfile === "deal-team" && workflow.module === "ccd-targets") {
+    return "Find high-quality public finance sources for recent California community college district bond/debt transactions, authorizations, refundings, and deal teams. Use an EMMA/OS/POS-first path when reachable: EMMA disclosure pages, Official Statement PDFs, POS PDFs, and bond PDFs are strongest. Use CDIAC/DebtWatch to discover or confirm deal records. Use official district board agenda packets, staff reports, resolutions, BondLink, and MuniOS as supporting sources. Sources must clearly relate to the exact requested community college district.";
   }
 
   if (sourceProfile === "deal-team") {
@@ -2986,8 +3610,8 @@ async function callAnthropicExtraction(
 function buildChatMessages(input: { institution: string; fields: readonly string[]; prompt: string; sourceList: string }) {
   const dealPackageRules = input.fields.some((field) => isDealTeamField(field))
     ? `
-Deal package rules:
-- Treat Last Deal, MA, UW, and BC as one transaction package.
+Deal-team role rules:
+- Return only the requested MA, Underwriter/UW, and BC fields. Do not return Last Deal from this workflow.
 - Only return transaction packages from ${minimumDealYear} or later. If the only supported deal is older than ${minimumDealYear}, return no fields.
 - The issuer/financing entity must be the exact requested school district, or a Community Facilities District (CFD), School Facilities Improvement District (SFID), special-tax bond, or similar financing explicitly named for/sponsored by the requested school district.
 - Do not use unrelated city, county, redevelopment, overlapping-agency, private-school, or similarly named CFD deals.
@@ -2995,9 +3619,8 @@ Deal package rules:
 - A ${preferredDealYear}/2026 transaction should beat a complete 2023/2024 package when the newer transaction has direct evidence. Use 2023/2024 only as fallback when no newer supported deal is found.
 - Prefer sources that name the financing participants directly: Municipal Advisor, Underwriter, Bond Counsel, or Financing Team.
 - If multiple sources disagree, prefer Official Statement/POS/EMMA/CDIAC over agenda snippets, rating reports, or news.
-- Do not mix MA/UW/BC from different transactions unless the evidence clearly says they belong to the same latest deal.
-- Last Deal may include up to two recent supported transactions when useful, separated by a newline. Format each line like "MMM YYYY - $XXM (CFD)", "MMM YYYY - $XXM (New Money GO)", or "MMM YYYY - $XXM (Ref)".
-- UW must be an underwriter, senior manager, purchaser, placement agent, direct purchaser, or dealer. Never put law firms, bond counsel, disclosure counsel, municipal advisors, or financial advisors in UW.
+- Do not mix deal-team roles from different transactions unless the evidence clearly says they belong to the same latest deal.
+- Underwriter/UW must be an underwriter, senior manager, purchaser, placement agent, direct purchaser, or dealer. Never put law firms, bond counsel, disclosure counsel, municipal advisors, or financial advisors in the underwriter field.
 - BC must be explicitly bond counsel. Do not use disclosure counsel as BC unless the source also labels the firm as bond counsel.
 - MA must be explicitly municipal advisor/adviser or financial advisor/adviser.
 - If only one field is supported and the source is not an Official Statement, POS, EMMA, CDIAC, DebtWatch, board agenda, board minutes, agenda-minutes packet, staff report, or resolution, omit it.`
@@ -3027,7 +3650,7 @@ Rules:
 - Do not infer names, titles, deal teams, or authorization amounts from stale or secondary sources.
 - When Board fields are requested, they should represent the current complete board roster when available, one current board member per field.
 - For Board fields, do not include former board members unless the source clearly says they are current.
-- Last Deal should be concise, usually date + amount + deal type.
+- When Last Deal is requested, it should be concise, usually date + amount + deal type.
 - Set confidence below 0.74 unless the evidence directly supports the value.
 
 Return JSON exactly in this shape:
@@ -3150,7 +3773,7 @@ function chooseDealTeamPackage(
       const bestFields = bestDealFields(validSourceCandidates, allowedFields);
       const coverage = bestFields.length;
       const hasLastDeal = bestFields.some((field) => field.field_key === "Last Deal");
-      const hasDealParticipant = bestFields.some((field) => field.field_key === "MA" || field.field_key === "UW" || field.field_key === "BC");
+      const hasDealParticipant = bestFields.some((field) => isDealTeamRoleField(field.field_key ?? ""));
       const averageConfidence =
         bestFields.reduce((sum, field) => sum + (normalizeConfidence(field.confidence) ?? minimumProviderConfidence), 0) /
         Math.max(bestFields.length, 1);
@@ -3195,7 +3818,7 @@ function enrichDealPackageFields(
   const enrichedFields = [...baseFields];
   const existingFieldKeys = new Set(enrichedFields.map((field) => field.field_key));
   const missingRoleFields = allowedFields.filter(
-    (fieldKey) => (fieldKey === "MA" || fieldKey === "UW" || fieldKey === "BC") && !existingFieldKeys.has(fieldKey)
+    (fieldKey) => isDealTeamRoleField(fieldKey) && !existingFieldKeys.has(fieldKey)
   );
 
   missingRoleFields.forEach((fieldKey) => {
@@ -3769,7 +4392,7 @@ function buildDealTeamPartialDiagnostic(
     return null;
   }
 
-  const missingFields = ["MA", "UW", "BC"].filter(
+  const missingFields = dealTeamRoleFields(workflowKey).filter(
     (fieldKey) => allowedFields.includes(fieldKey) && !fieldKeys.has(fieldKey)
   );
 
@@ -3904,10 +4527,10 @@ function buildSuggestions(
         field_key: fieldKey,
         current_value: currentValue,
         proposed_value: proposedValue,
-        source_title: fieldResult.source_title ?? (workflowKey === "deal-team" ? "Deal source" : "Perplexity source search"),
+        source_title: fieldResult.source_title ?? (workflows[workflowKey].sourceProfile === "deal-team" ? "Deal source" : "Perplexity source search"),
         source_url: sourceUrl,
         source_excerpt:
-          workflowKey === "deal-team"
+          workflows[workflowKey].sourceProfile === "deal-team"
             ? buildDealTeamSourceExcerpt(excerpt, fieldResult.providers)
             : buildSourceExcerpt(excerpt, fieldResult.providers),
         confidence
@@ -4130,7 +4753,15 @@ function isBoardField(fieldKey: string) {
 }
 
 function isDealTeamField(fieldKey: string) {
-  return fieldKey === "Last Deal" || fieldKey === "MA" || fieldKey === "UW" || fieldKey === "BC";
+  return fieldKey === "Last Deal" || isDealTeamRoleField(fieldKey);
+}
+
+function isDealTeamRoleField(fieldKey: string) {
+  return fieldKey === "MA" || isUnderwriterField(fieldKey) || fieldKey === "BC";
+}
+
+function isUnderwriterField(fieldKey: string) {
+  return fieldKey === "UW" || fieldKey === "Underwriter";
 }
 
 function isValidCandidateForWorkflow(workflowKey: WorkflowKey, candidate: AutomationFieldResult, institution: string) {
@@ -4198,7 +4829,7 @@ function dealTeamValidationReasons(candidate: AutomationFieldResult, institution
     return reasons;
   }
 
-  if (fieldKey === "UW") {
+  if (isUnderwriterField(fieldKey)) {
     if (
       !hasRoleEvidence(normalizedFieldEvidence, normalizedEvidence, [
       "underwriter",
@@ -4213,11 +4844,11 @@ function dealTeamValidationReasons(candidate: AutomationFieldResult, institution
     }
 
     if (hasDealLegalRole(normalizedValue)) {
-      reasons.push("value looks like legal counsel, not UW");
+      reasons.push("value looks like legal counsel, not underwriter");
     }
 
     if (hasAnyPhrase(normalizedValue, ["financial advisor", "financial adviser", "municipal advisor", "municipal adviser"])) {
-      reasons.push("value looks like advisor, not UW");
+      reasons.push("value looks like advisor, not underwriter");
     }
 
     return reasons;
@@ -4243,7 +4874,9 @@ function isL1StateFilingCandidate(candidate: AutomationFieldResult) {
 }
 
 function dealEvidenceMentionsInstitution(normalizedEvidence: string, institution: string) {
-  const aliases = k12SearchAliases(institution).map(normalizeIdentityText).filter(Boolean);
+  const aliases = uniqueStrings([...k12SearchAliases(institution), ...ccdSearchAliases(institution)])
+    .map(normalizeIdentityText)
+    .filter(Boolean);
   const genericInstitution = normalizeIdentityText(institution);
 
   if (genericInstitution && normalizedEvidence.includes(genericInstitution)) {
@@ -4433,6 +5066,12 @@ function minimumSuggestionConfidence(workflowKey: WorkflowKey) {
     : minimumConfidence;
 }
 
+function isDealWorkflow(workflowKey: WorkflowKey) {
+  const sourceProfile = workflows[workflowKey].sourceProfile;
+
+  return sourceProfile === "deal-team" || sourceProfile === "last-deal";
+}
+
 function formatConfidence(value: number | null) {
   if (value === null) {
     return "no confidence";
@@ -4451,10 +5090,10 @@ function isModuleKey(value: unknown): value is ModuleKey {
 
 function defaultWorkflowForModule(moduleKey: ModuleKey): WorkflowKey {
   if (moduleKey === "ccd-targets") {
-    return "ccd-leadership";
+    return "ccd-deal-facts";
   }
 
-  return "leadership";
+  return moduleKey === "k12-targets" ? "last-deal" : "leadership";
 }
 
 function entityLabel(moduleKey: ModuleKey) {

@@ -75,6 +75,7 @@ export const moduleColumns: Record<ModuleKey, ColumnDef[]> = {
     },
     { key: "Authorizations", label: "Authorizations", width: 150 },
     { key: "Refundings", label: "Refundings", width: 150 },
+    { key: "Last Deal", label: "Last Deal", width: 150 },
     { key: "Chancellor", label: "Chancellor", width: 170 },
     { key: "CFO", label: "CFO", width: 210, fullName: "Chief Financial Officer" },
     { key: "Underwriter", label: "Underwriter", width: 170 },
@@ -102,7 +103,7 @@ export const moduleColumns: Record<ModuleKey, ColumnDef[]> = {
 
 export const moduleFilterFields: Record<ModuleKey, string[]> = {
   "k12-targets": ["Area", "MA", "UW"],
-  "ccd-targets": ["Authorizations", "Underwriter", "MA"],
+  "ccd-targets": ["Authorizations", "Last Deal", "Underwriter", "MA"],
   plans: ["Role sale", "Lead", "MA"]
 };
 
@@ -487,7 +488,8 @@ function ccdTargetRecord(groupName: string, target: string, groupIndex: number, 
     isSystem: true,
     fields: fieldsFor("ccd-targets", {
       "CCD Targets": target,
-      Authorizations: "-"
+      Authorizations: "-",
+      "Last Deal": "-"
     })
   };
 }

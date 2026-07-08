@@ -88,7 +88,7 @@ For `Sup / CBO / Board` fields, the app requires at least two configured provide
 
 `Sup` and `CBO` use position replacement logic. `Board 1` through `Board 7` use roster diff logic: the app compares the current consensus board roster against the saved workbook roster, then suggests new members, replacements for possibly removed members, or clearing a saved member who is no longer found. Verified existing members do not create suggestions, and board order changes alone are ignored.
 
-Deal team research (`Last Deal / MA / UW / BC`) works as a deal package. It searches for high-quality public finance sources first: Official Statement/POS PDFs, EMMA, CDIAC/DebtWatch, district board agenda packets, staff reports, resolutions, BondLink, and MuniOS pages. The extractor prefers one latest supported transaction from 2023 or later and then suggests Last Deal, Municipal Advisor, Underwriter, and Bond Counsel fields from that package. Older deals are intentionally ignored. The suggestions are still stored field-by-field so reviewers can approve only the fields they trust.
+Deal team research (`Last Deal / MA / UW / BC` for K-12, `Last Deal / Underwriter / MA / BC` for CCD) works as a deal package. It prefers CDIAC/DebtWatch first, then uses high-quality public finance sources such as Official Statement/POS PDFs, EMMA, official agenda packets, staff reports, resolutions, BondLink, and MuniOS pages only when web/model fallback is explicitly enabled. The extractor prefers one latest supported transaction from 2023 or later and then suggests Last Deal, Municipal Advisor, Underwriter, and Bond Counsel fields from that package. Older deals are intentionally ignored. The suggestions are still stored field-by-field so reviewers can approve only the fields they trust.
 
 Source discovery runs multiple targeted searches per institution, dedupes the results, ranks likely official sources first, and lightly expands the top web pages into evidence text. This helps board rosters and deal team extraction because search snippets often omit the full list of trustees or financing participants.
 
@@ -103,10 +103,12 @@ For deal-team fields, the intended source hierarchy is now:
 Run the latest `lib/schema.sql` in Supabase to create:
 
 - `muni_issuer_profiles`: legal name, aliases, CUSIP-6 values, related entities, and scope rule.
-- `muni_deal_facts`: normalized state filing / OS facts by workbook row. The current `Last Deal / MA / UW / BC` workflow checks this table first.
+- `muni_deal_facts`: normalized state filing / OS facts by workbook row. The current K-12 and CCD Last Deal / deal-team workflows check this table first.
 - `muni_source_documents`: traceable source records for OS/POS/PDF/CSV/manual documents.
 
-When `muni_deal_facts` contains a scoped, 2023-or-newer row for a K-12 target, Update Center will create suggestions from that L1 record before spending API calls on web search. If the table is empty or has not been created yet, the app silently falls back to the existing OpenAI/Perplexity source discovery.
+When `muni_deal_facts` contains a scoped, 2023-or-newer row for a K-12 or CCD target, Update Center will create suggestions from that L1 record before spending API calls on web search. If the row has a `deal_state_id`/CDIAC number, the app also calls the DebtWatch Reports Section API for that CDIAC number and uses `LeadUnderwriter`, `FinancialOrMunicipalAdvisor`, and `BondCounsel` to fill K-12 `UW` or CCD `Underwriter`, plus `MA` and `BC`. If `deal_state_id` is not loaded yet but the workbook already has `Last Deal`, the deal-team workflow searches DebtWatch issues with issuer plus Last Deal evidence to recover the CDIAC number first. A reported `(none)` value is preserved as `(none)` so reviewers can tell the role was explicitly absent, not merely unsearched.
+
+To control cost, K-12 and CCD deal-team workflows run in CDIAC-only mode by default: they stop after Supabase L1 rows, DebtWatch Reports Section, and DebtWatch issue search. Set `DEAL_TEAM_WEB_FALLBACK=true` only when you intentionally want the broader OpenAI/Perplexity web-search fallback for rows that CDIAC cannot resolve. The older `K12_DEAL_TEAM_WEB_FALLBACK=true` flag is still accepted for compatibility.
 
 Minimum columns needed for an L1 deal row:
 
@@ -129,7 +131,7 @@ npm run prepare:muni-import -- ~/Downloads/debtwatch.csv --module k12-targets --
 ```
 
 4. Open `tmp/muni-deal-import.sql`, paste it into the Supabase SQL Editor, and run it.
-5. Return to Update Center and run `Last Deal / MA / UW / BC`. If `muni_deal_facts` has a scoped 2023+ match, the suggestion comes from L1 before any AI/web search.
+5. Return to Update Center and run the relevant `Last Deal` and deal-team workflow. If `muni_deal_facts` has a scoped 2023+ match, the suggestion comes from L1 before any AI/web search.
 
 The import script reads `lib/data.ts` to map workbook rows to stable `record_id` values. It accepts flexible CSV column names such as `Issuer`, `Issue Name`, `Sale Date`, `Principal Amount`, `Financial Advisor`, `Underwriter`, and `Bond Counsel`.
 
@@ -142,7 +144,7 @@ Optional model overrides:
 
 Recommended manual update cadence:
 
-- Deal team (`Last Deal / MA / UW / BC`): monthly for active targets, plus ad hoc scans when a district has a new agenda/OS/CDIAC signal.
+- Deal team (`Last Deal / MA / UW / BC` for K-12; `Last Deal / Underwriter / MA / BC` for CCD): monthly for active targets, plus ad hoc scans when an issuer has a new agenda/OS/CDIAC signal.
 - Leadership (`Sup / CBO / Board`): quarterly for all districts, plus ad hoc scans before meetings or pitches.
 - Authorization (`Auth`): quarterly.
 - Notes: manual only.

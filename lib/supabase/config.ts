@@ -38,6 +38,12 @@ export function getK12ExtractionProvider() {
   return process.env.K12_EXTRACTION_PROVIDER ?? process.env.AI_EXTRACTION_PROVIDER ?? "auto";
 }
 
+export function isDealTeamWebFallbackEnabled() {
+  return ["1", "true", "yes", "on"].includes(
+    (process.env.DEAL_TEAM_WEB_FALLBACK ?? process.env.K12_DEAL_TEAM_WEB_FALLBACK ?? "").trim().toLowerCase()
+  );
+}
+
 export function getPerplexityApiKey() {
   return process.env.PERPLEXITY_API_KEY ?? process.env.PUBFIN_API_KEY ?? "";
 }
