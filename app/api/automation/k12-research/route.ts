@@ -759,9 +759,11 @@ type MuniDealFactRow = {
   deal_sale_date?: string | null;
   deal_state_id?: string | null;
   deal_type?: string | null;
+  issuer_id?: string | null;
   issuer_name_reported?: string | null;
   ma?: string | null;
   municipal_advisor?: string | null;
+  record_id?: string | null;
   related_entity_name?: string | null;
   refunding_type?: string | null;
   source_excerpt?: string | null;
@@ -1255,9 +1257,11 @@ async function researchDealTeamFromL1(
     "deal_sale_date",
     "deal_state_id",
     "deal_type",
+    "issuer_id",
     "issuer_name_reported",
     "ma",
     "municipal_advisor",
+    "record_id",
     "related_entity_name",
     "refunding_type",
     "source_excerpt",
@@ -1731,6 +1735,8 @@ function filterL1DealRowsForInstitution(rows: MuniDealFactRow[], institution: st
   return rows.filter((row) => {
     const normalizedEvidence = normalizeIdentityText(
       [
+        row.record_id,
+        row.issuer_id,
         row.issuer_name_reported,
         row.related_entity_name,
         row.deal_name,
