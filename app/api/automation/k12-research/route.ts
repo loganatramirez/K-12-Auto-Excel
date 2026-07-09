@@ -866,6 +866,13 @@ type DebtWatchIssueSearchResponse = {
   totalMatchingRecords?: number;
 };
 
+type DebtWatchIssueMatch = {
+  cdiacNumber: string;
+  issueRecord?: DebtWatchIssueRecord | null;
+  matchSource: "debtwatch-search" | "direct-cdiac" | "local-deal-fact";
+  searchedCount: number;
+};
+
 type BoardRosterMember = AutomationFieldResult & {
   normalizedValue: string;
   value: string;
@@ -1190,7 +1197,10 @@ async function researchInstitution(
     const debtWatchAuthResult = await researchAuthorizationFromDebtWatch(
       institution,
       savedLastDeal,
-      extractors
+      extractors,
+      supabase,
+      moduleKey,
+      recordId
     );
 
     return (
@@ -1822,13 +1832,22 @@ function scoreDebtWatchIssueRecord(
 async function researchAuthorizationFromDebtWatch(
   institution: string,
   lastDeal: string,
-  extractors: ExtractorConfig[]
+  extractors: ExtractorConfig[],
+  supabase: SupabaseServerClient,
+  moduleKey: ModuleKey,
+  recordId: string
 ): Promise<AutomationResearchResult | null> {
   if (!lastDeal.trim()) {
     return null;
   }
 
-  const matchedIssue = await findDebtWatchIssueForLastDeal(institution, lastDeal);
+  const matchedIssue = await findAuthorizationDebtWatchIssue(
+    supabase,
+    moduleKey,
+    recordId,
+    institution,
+    lastDeal
+  );
 
   if (!matchedIssue) {
     return {
@@ -1858,7 +1877,7 @@ async function researchAuthorizationFromDebtWatch(
   if (adtrField) {
     return {
       candidate_diagnostics: [
-        `CDIAC ${matchedIssue.cdiacNumber} ADTR authorization records supplied remaining authorization from the latest reporting year.`
+        `CDIAC ${matchedIssue.cdiacNumber} ADTR authorization records supplied remaining authorization from the latest reporting year after ${authorizationIssueMatchLabel(matchedIssue)}.`
       ],
       fields: [adtrField],
       source_candidates: [debtWatchIssueSourceCandidate(matchedIssue.cdiacNumber, institution)],
@@ -1905,14 +1924,32 @@ async function researchAuthorizationFromDebtWatch(
     ...result,
     candidate_diagnostics: mergeCandidateDiagnostics([
       ...(result.candidate_diagnostics ?? []),
-      `Opened ${osSources.length} CDIAC OS/POS document${osSources.length === 1 ? "" : "s"} for CDIAC ${matchedIssue.cdiacNumber}.`
+      `Opened ${osSources.length} CDIAC OS/POS document${osSources.length === 1 ? "" : "s"} for CDIAC ${matchedIssue.cdiacNumber} after ${authorizationIssueMatchLabel(matchedIssue)}.`
     ]),
     source_candidates: osSources.map((source) => sourceCandidateFromSearchSource(source, "kept")),
     source_count: osSources.length
   };
 }
 
-async function findDebtWatchIssueForLastDeal(institution: string, lastDeal: string) {
+async function findAuthorizationDebtWatchIssue(
+  supabase: SupabaseServerClient,
+  moduleKey: ModuleKey,
+  recordId: string,
+  institution: string,
+  lastDeal: string
+): Promise<DebtWatchIssueMatch | null> {
+  const localIssue = await findLocalDebtWatchIssueForLastDeal(
+    supabase,
+    moduleKey,
+    recordId,
+    institution,
+    lastDeal
+  );
+
+  return localIssue ?? findDebtWatchIssueForLastDeal(institution, lastDeal);
+}
+
+async function findDebtWatchIssueForLastDeal(institution: string, lastDeal: string): Promise<DebtWatchIssueMatch | null> {
   const directCdiacNumber = extractCdiacNumbers(lastDeal)[0];
   const directIssueRecord = directCdiacNumber ? await fetchDebtWatchIssueRecord(directCdiacNumber) : null;
   const searchedIssueRecords = directIssueRecord
@@ -1928,8 +1965,120 @@ async function findDebtWatchIssueForLastDeal(institution: string, lastDeal: stri
   return {
     cdiacNumber,
     issueRecord: bestIssueRecord,
+    matchSource: directCdiacNumber ? "direct-cdiac" : "debtwatch-search",
     searchedCount: searchedIssueRecords.length
   };
+}
+
+async function findLocalDebtWatchIssueForLastDeal(
+  supabase: SupabaseServerClient,
+  moduleKey: ModuleKey,
+  recordId: string,
+  institution: string,
+  lastDeal: string
+): Promise<DebtWatchIssueMatch | null> {
+  const { data, error } = await supabase
+    .from("muni_deal_facts")
+    .select(muniDealFactSelectColumns())
+    .eq("module", moduleKey)
+    .eq("record_id", recordId)
+    .eq("scope_included", true)
+    .gte("deal_sale_date", `${minimumDealYear}-01-01`)
+    .order("deal_sale_date", { ascending: false })
+    .limit(12);
+
+  if (error || !data?.length) {
+    return null;
+  }
+
+  const rows = ((data ?? []) as MuniDealFactRow[]).filter((row) => cleanL1Value(row.deal_state_id));
+  const selectedDeal = chooseLocalDealFactForSavedLastDeal(rows, institution, lastDeal);
+  const cdiacNumber = cleanL1Value(selectedDeal?.deal_state_id);
+
+  if (!cdiacNumber) {
+    return null;
+  }
+
+  return {
+    cdiacNumber,
+    issueRecord: null,
+    matchSource: "local-deal-fact",
+    searchedCount: rows.length
+  };
+}
+
+function chooseLocalDealFactForSavedLastDeal(
+  rows: MuniDealFactRow[],
+  institution: string,
+  lastDeal: string
+) {
+  const scoredRows = rows
+    .map((row) => ({
+      row,
+      score: scoreLocalDealFactForSavedLastDeal(row, institution, lastDeal)
+    }))
+    .filter((candidate) => candidate.score >= 35)
+    .sort((left, right) => {
+      if (right.score !== left.score) {
+        return right.score - left.score;
+      }
+
+      return String(right.row.deal_sale_date ?? "").localeCompare(String(left.row.deal_sale_date ?? ""));
+    });
+
+  return scoredRows[0]?.row ?? null;
+}
+
+function scoreLocalDealFactForSavedLastDeal(
+  row: MuniDealFactRow,
+  institution: string,
+  lastDeal: string
+) {
+  if (!cleanL1Value(row.deal_state_id)) {
+    return 0;
+  }
+
+  const summary = formatL1DealSummary(row);
+
+  if (equivalentFormattedValue("k12-targets", "Last Deal", summary, lastDeal)) {
+    return 120;
+  }
+
+  const lastDealYears = extractYears(lastDeal);
+  const saleYear = Number(String(row.deal_sale_date ?? "").slice(0, 4));
+  const yearMatch = Number.isFinite(saleYear) && lastDealYears.includes(saleYear);
+  const lastDealAmounts = extractDealAmountNumbers(lastDeal);
+  const rowAmount = debtWatchNumber(row.deal_par_amount);
+  const amountMatch = rowAmount !== null && lastDealAmounts.some((amount) => amountsAreClose(rowAmount, amount));
+
+  if ((lastDealYears.length && !yearMatch) || (lastDealAmounts.length && !amountMatch)) {
+    return 0;
+  }
+
+  const normalizedLastDeal = normalizeIdentityText(lastDeal);
+  const normalizedRow = normalizeIdentityText([row.deal_name, row.deal_type, row.refunding_type].filter(Boolean).join(" "));
+  const lastDealKind = hasAnyPhrase(normalizedLastDeal, ["ref", "refunding"]) ? "ref" : "nm";
+  const rowKind = hasAnyPhrase(normalizedRow, ["ref", "refunding"]) ? "ref" : "nm";
+  const institutionScore = l1InstitutionMatchScore(row, institution);
+
+  return (
+    (institutionScore > 0 ? 15 : 0) +
+    (yearMatch ? 35 : 0) +
+    (amountMatch ? 55 : 0) +
+    (lastDealKind === rowKind ? 10 : 0)
+  );
+}
+
+function authorizationIssueMatchLabel(match: DebtWatchIssueMatch) {
+  if (match.matchSource === "local-deal-fact") {
+    return "matching the saved Last Deal to the local CDIAC deal fact";
+  }
+
+  if (match.matchSource === "direct-cdiac") {
+    return "using the CDIAC number in the saved Last Deal";
+  }
+
+  return "matching the saved Last Deal through DebtWatch issue search";
 }
 
 function buildDebtWatchAuthorizationField(
