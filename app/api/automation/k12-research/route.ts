@@ -1140,15 +1140,13 @@ async function researchInstitution(
   }
 
   if (sourceProfile === "ccd-refundings") {
-    const refundingResult = await researchCcdRefundingsFromL1(supabase, moduleKey, recordId, institution);
-
-    return (
-      refundingResult ?? {
-        candidate_diagnostics: [`No CDIAC/DebtWatch refunding deal fact is loaded for ${institution}.`],
-        fields: [],
-        source_count: 0
-      }
-    );
+    return {
+      candidate_diagnostics: [
+        "CCD Refundings automation is paused: the workbook column tracks future refunding opportunities, not historical CDIAC refunding transactions."
+      ],
+      fields: [],
+      source_count: 0
+    };
   }
 
   let l1DealResult =

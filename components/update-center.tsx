@@ -107,8 +107,8 @@ const workflowGroups: Record<ModuleKey, WorkflowGroup[]> = {
       label: "Refundings",
       fields: ["Refundings"],
       cadence:
-        "Suggested manual cadence: monthly for active CCD targets. Uses CDIAC/DebtWatch deal facts and only proposes supported refunding transactions.",
-      isAvailable: true
+        "Paused: this workbook field tracks future refunding opportunities, not historical CDIAC refunding transactions.",
+      isAvailable: false
     },
     {
       key: "ccd-deal-team",
