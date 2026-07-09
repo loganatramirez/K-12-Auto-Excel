@@ -14,16 +14,19 @@ if (args.help) {
 }
 
 const moduleKey = args.module ?? "k12-targets";
+const sourceModuleKey = args.sourceModule ?? moduleKey;
 const outputPath = args.out ?? path.join(repoRoot, "tmp", `${moduleKey}-static-deal-remap.sql`);
 const aliasFilePath = args.aliasFile;
 const targets = buildTargetMap(moduleKey);
 const extraAliases = aliasFilePath ? readAliasFile(path.resolve(aliasFilePath)) : {};
-const sql = buildRemapSql(moduleKey, targets, extraAliases);
+const sql = buildRemapSql(moduleKey, sourceModuleKey, targets, extraAliases);
 
 fs.mkdirSync(path.dirname(outputPath), { recursive: true });
 fs.writeFileSync(outputPath, sql);
 
-console.log(`Prepared static deal remap SQL for ${targets.length} ${moduleKey} target(s).`);
+console.log(
+  `Prepared static deal remap SQL for ${targets.length} ${moduleKey} target(s) from ${sourceModuleKey} source rows.`
+);
 console.log(`Wrote ${outputPath}`);
 
 function parseArgs(argv) {
@@ -39,6 +42,12 @@ function parseArgs(argv) {
 
     if (value === "--module") {
       parsed.module = argv[index + 1];
+      index += 1;
+      continue;
+    }
+
+    if (value === "--source-module") {
+      parsed.sourceModule = argv[index + 1];
       index += 1;
       continue;
     }
@@ -61,11 +70,13 @@ function parseArgs(argv) {
 
 function printHelp() {
   console.log(`Usage:
-  node scripts/prepare-static-deal-remap-sql.mjs [--module k12-targets] [--out tmp/k12-targets-static-deal-remap.sql] [--alias-file aliases.json]
+  node scripts/prepare-static-deal-remap-sql.mjs [--module k12-targets] [--source-module k12-targets] [--out tmp/k12-targets-static-deal-remap.sql] [--alias-file aliases.json]
 
 Purpose:
   Generates SQL that remaps existing generated CDIAC/DebtWatch muni_deal_facts rows
   such as k12-cdiac-* onto the workbook's static target record ids such as k12-03-01.
+  Use --source-module when broad CDIAC rows were imported under one module but should
+  be copied onto another workbook module, for example ccd-targets from k12-targets.
 
 Workflow:
   1. Import broad CDIAC rows into Supabase.
@@ -173,8 +184,35 @@ function targetAliases(target, extraAliases = []) {
     "Berryessa Union SD": ["Berryessa Union School District"],
     "Long Beach CCD": ["Long Beach Community College District", "Long Beach City College", "LBCCD"],
     "Berkeley CCD": ["Peralta Community College District", "Berkeley City College"],
+    "San Bernardino CCD": ["San Bernardino Community College District", "SBCCD"],
+    "Santa Monica CCD": ["Santa Monica Community College District", "Santa Monica College", "SMC"],
+    "Southwestern CCD": ["Southwestern Community College District", "Southwestern College"],
+    "Los Rios CCD": ["Los Rios Community College District", "LRCCD"],
+    "Los Angeles CCD": ["Los Angeles Community College District", "LACCD"],
+    "Desert CCD": ["Desert Community College District", "College of the Desert"],
+    "West Hills CCD": ["West Hills Community College District", "WHCCD"],
+    "San Diego CCD": ["San Diego Community College District", "SDCCD"],
+    "San Joaquin Delta": ["San Joaquin Delta Community College District", "San Joaquin Delta College"],
+    "Cerritos CCD": ["Cerritos Community College District", "Cerritos College"],
+    "San Francisco CCD": ["City College of San Francisco", "San Francisco Community College District"],
+    "Pasadena CCD": ["Pasadena Area Community College District", "Pasadena City College"],
+    "San Mateo Cnty CCD": ["San Mateo County Community College District", "SMCCCD"],
+    "State Center CCD": ["State Center Community College District", "SCCCD"],
+    "Riverside CCD": ["Riverside Community College District", "RCCD"],
+    "Foothill De Anza CCD": ["Foothill-De Anza Community College District", "FHDA"],
     Peralta: ["Peralta Community College District"],
-    "San Jose-Evergreen": ["San Jose Evergreen Community College District", "San Jose-Evergreen Community College District"]
+    "West Valley Mission": ["West Valley-Mission Community College District", "WVMCCD"],
+    "Mt. Sac CCD": ["Mt. San Antonio Community College District", "Mt. SAC"],
+    "Glendale CCD": ["Glendale Community College District", "Glendale Community College"],
+    "Rio Hondo CCD": ["Rio Hondo Community College District", "Rio Hondo College"],
+    "Gavilan JCCD": ["Gavilan Joint Community College District", "Gavilan College"],
+    "Contra Costa CCD": ["Contra Costa Community College District", "4CD"],
+    "San Jose-Evergreen": [
+      "San Jose Evergreen Community College District",
+      "San José-Evergreen Community College District",
+      "San Jose-Evergreen Community College District",
+      "SJECCD"
+    ]
   };
 
   (knownAliases[title] ?? []).forEach((alias) => baseAliases.add(alias));
@@ -202,7 +240,7 @@ function targetAliases(target, extraAliases = []) {
     .filter((alias) => alias.length >= 5);
 }
 
-function buildRemapSql(moduleKey, targets, extraAliases) {
+function buildRemapSql(moduleKey, sourceModuleKey, targets, extraAliases) {
   const targetRows = targets.map((target) => {
     const aliases = targetAliases(target, extraAliases[target.title]);
 
@@ -216,7 +254,8 @@ function buildRemapSql(moduleKey, targets, extraAliases) {
   });
 
   return `-- Generated by scripts/prepare-static-deal-remap-sql.mjs
--- Source module: ${moduleKey}
+-- Source module: ${sourceModuleKey}
+-- Target module: ${moduleKey}
 -- Target count: ${targets.length}
 -- Purpose: copy generated CDIAC/DebtWatch facts onto static workbook record ids.
 
@@ -293,8 +332,7 @@ select
   source_facts.*
 from muni_deal_facts source_facts
 join _target_static_map target_map
-  on target_map.module = source_facts.module
-  and exists (
+  on exists (
     select 1
     from unnest(target_map.aliases) as alias(value)
     where pg_temp.k12_import_norm(
@@ -309,10 +347,10 @@ join _target_static_map target_map
       )
     ) like '%' || alias.value || '%'
   )
-where source_facts.module = ${sqlString(moduleKey)}
+where source_facts.module = ${sqlString(sourceModuleKey)}
   and source_facts.scope_included = true
   and source_facts.deal_sale_date >= date '${minimumDealYear}-01-01'
-  and source_facts.record_id !~ '^k12-[0-9]{2}-[0-9]{2}$'
+  and source_facts.record_id !~ '^(k12|ccd)-[0-9]{2}-[0-9]{2}$'
   and nullif(trim(source_facts.deal_state_id), '') is not null;
 
 insert into muni_deal_facts (
@@ -346,7 +384,7 @@ insert into muni_deal_facts (
   raw_payload
 )
 select
-  matches.module,
+  ${sqlString(moduleKey)},
   matches.target_record_id,
   profiles.id,
   matches.target_issuer_id,
@@ -423,8 +461,16 @@ select
   count(distinct deal_state_id)
 from muni_deal_facts
 where module = ${sqlString(moduleKey)}
-  and record_id ~ '^k12-[0-9]{2}-[0-9]{2}$';
+  and record_id ~ ${sqlString(`^${staticRecordPrefix(moduleKey)}-[0-9]{2}-[0-9]{2}$`)};
 `;
+}
+
+function staticRecordPrefix(moduleKey) {
+  if (moduleKey === "ccd-targets") {
+    return "ccd";
+  }
+
+  return "k12";
 }
 
 function stableIssuerId(moduleKey, recordId) {

@@ -1,18 +1,18 @@
-# K-12 Last Deal Data Refresh Runbook
+# K-12 / CCD Last Deal Data Refresh Runbook
 
-Use this runbook when K-12 Last Deal suggestions do not appear after importing CDIAC or DebtWatch data into Supabase.
+Use this runbook when K-12 or CCD Last Deal suggestions do not appear after importing CDIAC or DebtWatch data into Supabase.
 
 ## Ticket For Codex
 
 You are working in the `loganatramirez/K-12-Auto-Excel` repo.
 
-Goal: make the K-12 Update Center generate Last Deal suggestions for the current workbook target list using Supabase `muni_deal_facts`.
+Goal: make the Update Center generate Last Deal suggestions for the current workbook target list using Supabase `muni_deal_facts`.
 
 Do not assume that a successful Supabase import means the workbook rows are connected. First prove that imported deal facts map to the current static workbook record ids.
 
 ### Context
 
-The K-12 workbook rows are static in `lib/data.ts`.
+The K-12 and CCD workbook rows are static in `lib/data.ts`.
 
 Valid K-12 workbook target `record_id` values look like:
 
@@ -20,6 +20,14 @@ Valid K-12 workbook target `record_id` values look like:
 k12-01-01
 k12-03-25
 k12-08-03
+```
+
+Valid CCD workbook target `record_id` values look like:
+
+```text
+ccd-01-01
+ccd-03-02
+ccd-05-05
 ```
 
 Generated CDIAC issuer-import ids look like:
@@ -30,12 +38,12 @@ k12-cdiac-los-angeles-unified-school-district-...
 k12-cdiac-menifee-union-school-district-...
 ```
 
-The app can use generated CDIAC ids as fallback evidence, but the best and most reliable path is to import rows mapped to the current workbook ids.
+The app can use generated CDIAC ids as fallback evidence, but the best and most reliable path is to copy matching rows onto the current workbook ids.
 
-The K-12 Last Deal workflow only creates suggestions from rows that pass all of these gates:
+The K-12 and CCD Last Deal workflows only create suggestions from rows that pass all of these gates:
 
 ```sql
-module = 'k12-targets'
+module in ('k12-targets', 'ccd-targets')
 scope_included = true
 deal_sale_date >= date '2023-01-01'
 ```
@@ -128,7 +136,7 @@ If rows are pending, approve or reject them in Update Center before expecting th
 
 ### 5. Import The Correct Mapped Deal Facts
 
-Use the repo import script against the current `lib/data.ts`.
+If you have a fresh DebtWatch CSV, use the repo import script against the current `lib/data.ts`.
 
 ```bash
 npm run prepare:muni-import -- /path/to/debtwatch.csv --module k12-targets --out tmp/muni-deal-import.sql --alias-file scripts/muni-aliases.example.json
@@ -147,12 +155,28 @@ npm run prepare:muni-import -- /path/to/debtwatch.csv --module k12-targets --out
 
 Do not commit local data files or generated SQL under `tmp/`.
 
+If the broad CDIAC import has already been loaded as generated rows, generate static remap SQL instead:
+
+```bash
+npm run prepare:k12-static-remap
+npm run prepare:ccd-static-remap
+```
+
+Then run both generated SQL files in Supabase SQL Editor:
+
+```text
+tmp/k12-targets-static-deal-remap.sql
+tmp/ccd-targets-static-deal-remap.sql
+```
+
+The CCD remap intentionally reads broad source rows from `module = 'k12-targets'` and writes matched rows into `module = 'ccd-targets'` with static ids like `ccd-02-01`. This is required when one broad CDIAC import feeds both K-12 and CCD workflows.
+
 ### 6. Run Update Center
 
 In the deployed app:
 
 1. Go to `/updates`.
-2. Select `K-12 Targets`.
+2. Select `K-12 Targets` or `CCD Targets`.
 3. Select `Last Deal`.
 4. Select the target rows to scan.
 5. Click `Run research`.
@@ -173,7 +197,7 @@ Use SQL:
 ```sql
 select record_id, proposed_value, source_title, source_url, created_at
 from update_suggestions
-where module = 'k12-targets'
+where module in ('k12-targets', 'ccd-targets')
   and field_key = 'Last Deal'
 order by created_at desc
 limit 100;
