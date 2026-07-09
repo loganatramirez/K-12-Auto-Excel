@@ -128,7 +128,7 @@ const workflows: Record<WorkflowKey, WorkflowConfig> = {
     fields: ["Auth"],
     module: "k12-targets",
     prompt:
-      "Extract only remaining unissued GO bond authorization outstanding, preferably by voter-approved election/measure. Prefer the latest Official Statement/POS/offering document tied to the saved Last Deal because those documents often include an authorization table. Report concise amounts still available with an as-of/source date. Do not report original bond measure authorization unless the same source also states the unissued remaining amount.",
+      "Extract only remaining unissued GO bond authorization outstanding, preferably by voter-approved election/measure. Prefer the latest Official Statement/POS/offering document tied to the saved Last Deal because those documents often include an authorization table. Report concise amounts still available with an as-of/source date, including $0 when the source states no remaining authorization. Do not report original bond measure authorization unless the same source also states the unissued remaining amount.",
     queries: k12AuthorizationQueries,
     sourceProfile: "authorization"
   },
@@ -909,6 +909,8 @@ export async function POST(request: Request) {
   }
 
   if (
+    workflow.sourceProfile !== "authorization" &&
+    workflow.sourceProfile !== "ccd-refundings" &&
     workflow.sourceProfile !== "last-deal" &&
     workflow.sourceProfile !== "deal-team" &&
     workflow.sourceProfile !== "plan-deal-facts"
@@ -1191,23 +1193,17 @@ async function researchInstitution(
       extractors
     );
 
-    if (debtWatchAuthResult?.fields?.length) {
-      return debtWatchAuthResult;
-    }
-
-    if (!sourceSearchConfigs.length || !extractors.length) {
-      return (
-        debtWatchAuthResult ?? {
-          candidate_diagnostics: [
-            savedLastDeal
-              ? `No CDIAC/DebtWatch OS or ADTR remaining authorization evidence was found for saved Last Deal "${savedLastDeal}".`
-              : "No saved Last Deal is available to locate a CDIAC OS/POS for remaining authorization."
-          ],
-          fields: [],
-          source_count: 0
-        }
-      );
-    }
+    return (
+      debtWatchAuthResult ?? {
+        candidate_diagnostics: [
+          savedLastDeal
+            ? `No CDIAC/DebtWatch OS or ADTR remaining authorization evidence was found for saved Last Deal "${savedLastDeal}".`
+            : "No saved Last Deal is available to locate a CDIAC OS/POS for remaining authorization."
+        ],
+        fields: [],
+        source_count: 0
+      }
+    );
   }
 
   if (!sourceSearchConfigs.length || !extractors.length) {
@@ -1222,15 +1218,11 @@ async function researchInstitution(
     };
   }
 
-  const sourceQueries = sourceProfile === "authorization"
-    ? authorizationQueriesForLastDeal(institution, savedLastDeal, workflows[workflowKey].queries(institution))
-    : undefined;
   const searchResult = await researchInstitutionFromSources(
     institution,
     workflowKey,
     sourceSearchConfigs,
-    extractors,
-    sourceQueries
+    extractors
   );
 
   if (!l1DealResult) {
@@ -1957,7 +1949,7 @@ function buildDebtWatchAuthorizationField(
     .filter((row) => {
       const remainingAmount = debtWatchNumber(row.record.AuthAmountEndPeriod);
 
-      return remainingAmount !== null && remainingAmount > 0;
+      return remainingAmount !== null && remainingAmount >= 0;
     });
 
   if (!latestRows.length) {
@@ -1967,17 +1959,17 @@ function buildDebtWatchAuthorizationField(
   const value = latestRows
     .map((row) => {
       const authName = debtWatchText(row.record.AuthName) ?? "Authorization";
-      const remainingAmount = debtWatchNumber(row.record.AuthAmountEndPeriod);
+      const remainingAmount = formatAuthorizationAmount(row.record.AuthAmountEndPeriod);
 
-      return `${authName}: ${formatParAmount(remainingAmount)} remaining as of ${row.reportingYear} CDIAC ADTR`;
+      return `${authName}: ${remainingAmount} remaining as of ${row.reportingYear} CDIAC ADTR`;
     })
     .join("; ");
   const excerpt = latestRows
     .map((row) => {
       const authName = debtWatchText(row.record.AuthName) ?? "Authorization";
-      const originalAmount = formatParAmount(debtWatchNumber(row.record.AuthOriginalAmount));
-      const issuedAmount = formatParAmount(debtWatchNumber(row.record.AuthIssuance));
-      const remainingAmount = formatParAmount(debtWatchNumber(row.record.AuthAmountEndPeriod));
+      const originalAmount = formatAuthorizationAmount(row.record.AuthOriginalAmount);
+      const issuedAmount = formatAuthorizationAmount(row.record.AuthIssuance);
+      const remainingAmount = formatAuthorizationAmount(row.record.AuthAmountEndPeriod);
 
       return `${authName}: original authorization ${originalAmount || "n/a"}; issued ${issuedAmount || "n/a"}; remaining authorization/end-period amount ${remainingAmount}; reporting year ${row.reportingYear}.`;
     })
@@ -1992,6 +1984,16 @@ function buildDebtWatchAuthorizationField(
     source_url: debtWatchIssueReportUrl(cdiacNumber),
     value
   };
+}
+
+function formatAuthorizationAmount(value: unknown) {
+  const amount = debtWatchNumber(value);
+
+  if (amount === null) {
+    return "";
+  }
+
+  return amount === 0 ? "$0" : formatParAmount(amount);
 }
 
 function debtWatchOfficialStatementSources(detail: DebtWatchIssuanceDetailResponse, cdiacNumber: string): SearchSource[] {
@@ -4476,7 +4478,7 @@ Rules:
 - When Board fields are requested, they should represent the current complete board roster when available, one current board member per field.
 - For Board fields, do not include former board members unless the source clearly says they are current.
 - When Last Deal is requested, return only date / par amount / NM or Ref. Use NM for new money and Ref for refunding. Example: "Apr 2026 / $397.505M / NM".
-- When Auth is requested, return only remaining/unissued GO bond authorization outstanding, preferably by election/measure. Prefer CDIAC ADTR auth records or the latest OS/POS/offering document. Include an as-of/source date such as "Measure J: $120M remaining as of 2025 OS". If sources only show original authorization, bond measure amount, election result, or maximum bonded indebtedness without remaining/unissued authorization, omit the field.
+- When Auth is requested, return only remaining/unissued GO bond authorization outstanding, preferably by election/measure. Prefer CDIAC ADTR auth records or the latest OS/POS/offering document. Include an as-of/source date such as "Measure J: $120M remaining as of 2025 OS" or "$0 remaining as of 2025 CDIAC ADTR". If sources only show original authorization, bond measure amount, election result, or maximum bonded indebtedness without remaining/unissued authorization, omit the field.
 - Set confidence below 0.74 unless the evidence directly supports the value.
 
 Return JSON exactly in this shape:
@@ -5167,6 +5169,13 @@ function buildNoSuggestionDiagnostic(
     searchInstitution
   );
   const candidateDiagnostics = [...buildRejectionDiagnostics, ...(result.candidate_diagnostics ?? [])].slice(0, 3);
+
+  if (sourceProfile === "authorization" && candidateDiagnostics.length) {
+    return {
+      institution,
+      message: candidateDiagnostics.join(" | ")
+    };
+  }
 
   if (!sourceCount) {
     return {
