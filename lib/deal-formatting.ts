@@ -262,13 +262,13 @@ function extractDealDate(value: string) {
 }
 
 function extractDealAmount(value: string) {
-  const explicitDollar = value.match(/\$\s?\d[\d,]*(?:\.\d+)?\s?(?:m|mm|million)?/i)?.[0];
+  const explicitDollar = value.match(/\$\s?\d[\d,]*(?:\.\d+)?\s?(?:million|mm|m)?/i)?.[0];
 
   if (explicitDollar) {
     return normalizeDollarAmount(explicitDollar);
   }
 
-  const millionAmount = value.match(/\b\d[\d,]*(?:\.\d+)?\s?(?:m|mm|million)\b/i)?.[0];
+  const millionAmount = value.match(/\b\d[\d,]*(?:\.\d+)?\s?(?:million|mm|m)\b/i)?.[0];
 
   if (millionAmount) {
     return normalizeDollarAmount(millionAmount);
@@ -282,14 +282,14 @@ function normalizeDollarAmount(value: string) {
   const numeric = cleaned
     .replace(/\$/g, "")
     .replace(/,/g, "")
-    .replace(/\s*(?:m|mm|million)\s*$/i, "");
+    .replace(/\s*(?:million|mm|m)\s*$/i, "");
   const numberValue = Number(numeric);
 
   if (!Number.isFinite(numberValue)) {
     return cleaned.startsWith("$") ? cleaned : `$${cleaned}`;
   }
 
-  const millions = /\b(?:m|mm|million)\s*$/i.test(cleaned) ? numberValue : numberValue / 1_000_000;
+  const millions = /(?:million|mm|m)\s*$/i.test(cleaned) ? numberValue : numberValue / 1_000_000;
   const rounded = Math.round(millions * 1000) / 1000;
   const formatted = Number.isInteger(rounded) ? String(rounded) : String(rounded).replace(/0+$/, "").replace(/\.$/, "");
 
