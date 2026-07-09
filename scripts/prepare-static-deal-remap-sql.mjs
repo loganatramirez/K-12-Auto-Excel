@@ -98,12 +98,19 @@ function buildTargetMap(moduleKey) {
     return extractGroupedTargets(source, "ccdGroups", "targets", "ccd");
   }
 
-  throw new Error(`Unsupported module "${moduleKey}". Use k12-targets or ccd-targets.`);
+  if (moduleKey === "plans") {
+    return extractGroupedTargets(source, "planSections", "issuers", "plan");
+  }
+
+  throw new Error(`Unsupported module "${moduleKey}". Use k12-targets, ccd-targets, or plans.`);
 }
 
 function extractGroupedTargets(source, constName, listKey, recordPrefix) {
   const block = extractConstArray(source, constName);
-  const groupRegex = new RegExp(`\\{\\s*name:\\s*"([^"]+)"[\\s\\S]*?${listKey}:\\s*\\[([\\s\\S]*?)\\]\\s*\\}`, "g");
+  const groupRegex = new RegExp(
+    `\\{\\s*name:\\s*"([^"]+)"[\\s\\S]*?${listKey}:\\s*\\[([\\s\\S]*?)\\]\\s*(?:as\\s+string\\[\\])?\\s*\\}`,
+    "g"
+  );
   const targets = [];
   let groupMatch;
   let groupIndex = 0;
@@ -127,13 +134,14 @@ function extractGroupedTargets(source, constName, listKey, recordPrefix) {
 }
 
 function extractConstArray(source, constName) {
-  const start = source.indexOf(`const ${constName} = [`);
+  const start = source.indexOf(`const ${constName}`);
 
   if (start === -1) {
     throw new Error(`Could not find ${constName} in lib/data.ts.`);
   }
 
-  const arrayStart = source.indexOf("[", start);
+  const assignmentStart = source.indexOf("=", start);
+  const arrayStart = source.indexOf("[", assignmentStart);
   let depth = 0;
 
   for (let index = arrayStart; index < source.length; index += 1) {
@@ -207,6 +215,19 @@ function targetAliases(target, extraAliases = []) {
     "Rio Hondo CCD": ["Rio Hondo Community College District", "Rio Hondo College"],
     "Gavilan JCCD": ["Gavilan Joint Community College District", "Gavilan College"],
     "Contra Costa CCD": ["Contra Costa Community College District", "4CD"],
+    "SB CCD": ["San Bernardino Community College District", "San Bernardino CCD", "SBCCD"],
+    "Ontario City": ["City of Ontario", "Ontario Public Financing Authority", "Ontario Financing Authority"],
+    "Inglewood": ["City of Inglewood", "Inglewood Public Financing Authority"],
+    "Monterey Park": ["City of Monterey Park"],
+    Hawthorne: ["City of Hawthorne"],
+    Watsonville: ["City of Watsonville"],
+    Azusa: ["City of Azusa"],
+    Pomona: ["City of Pomona", "Pomona Public Financing Authority"],
+    Carson: ["City of Carson", "Carson Public Financing Authority"],
+    "El Centro City": ["City of El Centro"],
+    "Palmdale SD": ["Palmdale School District"],
+    "Lynwood USD": ["Lynwood Unified School District"],
+    "Evergreen SD": ["Evergreen School District"],
     "San Jose-Evergreen": [
       "San Jose Evergreen Community College District",
       "San José-Evergreen Community College District",
@@ -234,6 +255,10 @@ function targetAliases(target, extraAliases = []) {
       baseAliases.add(title.replace(pattern, replacement));
     }
   });
+
+  if (/\s+City$/i.test(title)) {
+    baseAliases.add(`City of ${title.replace(/\s+City$/i, "")}`);
+  }
 
   return Array.from(baseAliases)
     .map((alias) => normalizeIdentity(alias))
@@ -350,7 +375,7 @@ join _target_static_map target_map
 where source_facts.module = ${sqlString(sourceModuleKey)}
   and source_facts.scope_included = true
   and source_facts.deal_sale_date >= date '${minimumDealYear}-01-01'
-  and source_facts.record_id !~ '^(k12|ccd)-[0-9]{2}-[0-9]{2}$'
+  and source_facts.record_id !~ '^(k12|ccd|plan)-[0-9]{2}-[0-9]{2}$'
   and nullif(trim(source_facts.deal_state_id), '') is not null;
 
 insert into muni_deal_facts (
@@ -468,6 +493,10 @@ where module = ${sqlString(moduleKey)}
 function staticRecordPrefix(moduleKey) {
   if (moduleKey === "ccd-targets") {
     return "ccd";
+  }
+
+  if (moduleKey === "plans") {
+    return "plan";
   }
 
   return "k12";

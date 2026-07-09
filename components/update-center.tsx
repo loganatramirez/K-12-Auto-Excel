@@ -120,25 +120,17 @@ const workflowGroups: Record<ModuleKey, WorkflowGroup[]> = {
   ],
   plans: [
     {
-      key: "plan-fields",
-      label: "Plan Fields",
+      key: "plan-deal-facts",
+      label: "CDIAC Deal Facts",
       fields: [
         "MA",
         "Deal",
-        "Role sale",
         "Date",
-        "Par ($M)",
-        "Fee",
-        "Liab.",
-        "EST Rev",
-        "Prob.",
-        "ADJ Rev",
-        "Lead",
-        "SRSupp.",
-        "Supp."
+        "Par ($M)"
       ],
-      cadence: "FY25&26 automation is not wired yet. This tab is ready for future plan review suggestions.",
-      isAvailable: false
+      cadence:
+        "Suggested manual cadence: monthly or before plan review. Uses local CDIAC/DebtWatch data for objective deal facts only; fee, probability, revenue, and staffing fields remain manual.",
+      isAvailable: true
     }
   ]
 };

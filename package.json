@@ -9,7 +9,8 @@
     "typecheck": "tsc --noEmit",
     "prepare:muni-import": "node scripts/prepare-muni-deal-import.mjs",
     "prepare:k12-static-remap": "node scripts/prepare-static-deal-remap-sql.mjs",
-    "prepare:ccd-static-remap": "node scripts/prepare-static-deal-remap-sql.mjs --module ccd-targets --source-module k12-targets --out tmp/ccd-targets-static-deal-remap.sql"
+    "prepare:ccd-static-remap": "node scripts/prepare-static-deal-remap-sql.mjs --module ccd-targets --source-module k12-targets --out tmp/ccd-targets-static-deal-remap.sql",
+    "prepare:plan-static-remap": "node scripts/prepare-static-deal-remap-sql.mjs --module plans --source-module k12-targets --out tmp/plans-static-deal-remap.sql"
   },
   "dependencies": {
     "@supabase/ssr": "^0.12.0",

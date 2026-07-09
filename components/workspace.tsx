@@ -200,13 +200,14 @@ export function Workspace({ moduleKey }: { moduleKey: ModuleKey }) {
           ...row.fields,
           [key]: value
         };
+        const fields = applyComputedFields(row.module, row.kind, nextFields);
         const firstColumn = columns[0]?.key;
 
         return {
           ...row,
           title: key === firstColumn ? value || row.title : row.title,
           updatedAt: new Date().toISOString().slice(0, 10),
-          fields: nextFields
+          fields
         };
       })
     );
@@ -259,7 +260,11 @@ export function Workspace({ moduleKey }: { moduleKey: ModuleKey }) {
   }
 
   async function addRow() {
-    const fields = Object.fromEntries(columns.map((column) => [column.key, ""]));
+    const fields = applyComputedFields(
+      moduleKey,
+      undefined,
+      Object.fromEntries(columns.map((column) => [column.key, ""]))
+    );
     const newRow: WorkspaceRecord = {
       id: `${moduleKey}-${Date.now()}`,
       module: moduleKey,
@@ -607,7 +612,7 @@ function mergeSupabaseRows(
       ...row,
       title: title || row.title,
       updatedAt,
-      fields
+      fields: applyComputedFields(row.module, row.kind, fields)
     };
   });
 
@@ -621,7 +626,7 @@ function mergeSupabaseRows(
       updatedAt: row.updated_at?.slice(0, 10) ?? new Date().toISOString().slice(0, 10),
       kind: row.kind ?? "record",
       tone: row.tone ?? undefined,
-      fields: fieldsForRow(row.module, row.fields ?? {})
+      fields: applyComputedFields(row.module, row.kind ?? "record", fieldsForRow(row.module, row.fields ?? {}))
     }));
 
   return [...mergedBaseRows, ...mergedCustomRows];
@@ -664,13 +669,98 @@ function normalizeImportMarker(value: FieldValue | null | undefined) {
 }
 
 function isCellLocked(row?: WorkspaceRecord, column?: ColumnDef) {
-  return Boolean(row?.isSystem && (row.kind === "section" || column?.isSystem));
+  return Boolean(
+    row?.isSystem && (row.kind === "section" || column?.isSystem) ||
+      (row?.module === "plans" && row.kind !== "section" && isPlanFormulaField(column?.key))
+  );
 }
 
 function fieldsForRow(moduleKey: ModuleKey, values: Record<string, FieldValue>) {
   return Object.fromEntries(
     moduleColumns[moduleKey].map((column) => [column.key, values[column.key] ?? ""])
   );
+}
+
+function applyComputedFields(
+  moduleKey: ModuleKey,
+  rowKind: WorkspaceRecord["kind"] | undefined,
+  fields: Record<string, FieldValue>
+) {
+  if (moduleKey !== "plans" || rowKind === "section") {
+    return fields;
+  }
+
+  const estimatedRevenue = calculateEstimatedRevenue(fields);
+  const adjustedRevenue = calculateAdjustedRevenue(estimatedRevenue, fields);
+
+  return {
+    ...fields,
+    "EST Rev": estimatedRevenue === null ? "" : formatRevenueThousands(estimatedRevenue),
+    "ADJ Rev": adjustedRevenue === null ? "" : formatRevenueThousands(adjustedRevenue)
+  };
+}
+
+function calculateEstimatedRevenue(fields: Record<string, FieldValue>) {
+  const parMillions = parseParMillions(fields["Par ($M)"]);
+  const fee = parseNumber(fields.Fee);
+  const liability = parsePercent(fields["Liab."]);
+
+  if (parMillions === null || fee === null || liability === null) {
+    return null;
+  }
+
+  return parMillions * fee * liability;
+}
+
+function calculateAdjustedRevenue(estimatedRevenue: number | null, fields: Record<string, FieldValue>) {
+  const probability = parsePercent(fields["Prob."]);
+
+  if (estimatedRevenue === null || probability === null) {
+    return null;
+  }
+
+  return estimatedRevenue * probability;
+}
+
+function parseParMillions(value: FieldValue | null | undefined) {
+  const numberValue = parseNumber(value);
+
+  if (numberValue === null) {
+    return null;
+  }
+
+  return numberValue > 100000 ? numberValue / 1_000_000 : numberValue;
+}
+
+function parseNumber(value: FieldValue | null | undefined) {
+  const cleaned = String(value ?? "")
+    .trim()
+    .replace(/[$,%]/g, "")
+    .replace(/,/g, "")
+    .replace(/\s*(?:m|mm|million)\s*$/i, "");
+  const numberValue = Number(cleaned);
+
+  return Number.isFinite(numberValue) ? numberValue : null;
+}
+
+function parsePercent(value: FieldValue | null | undefined) {
+  const numberValue = parseNumber(value);
+
+  if (numberValue === null) {
+    return null;
+  }
+
+  return numberValue > 1 ? numberValue / 100 : numberValue;
+}
+
+function formatRevenueThousands(value: number) {
+  const rounded = Math.round(value);
+
+  return `$${rounded.toLocaleString("en-US")}`;
+}
+
+function isPlanFormulaField(key?: string) {
+  return key === "EST Rev" || key === "ADJ Rev";
 }
 
 function unique(values: string[]) {
