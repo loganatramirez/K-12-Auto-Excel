@@ -1,6 +1,12 @@
 import { NextResponse } from "next/server";
 import { getModuleRows, type ModuleKey, type WorkspaceRecord } from "@/lib/data";
 import {
+  equivalentFormattedValue,
+  formatDealTeamValue,
+  formatLastDealParts,
+  formatWorkbookFieldValue
+} from "@/lib/deal-formatting";
+import {
   getK12ExtractionProvider,
   getOpenAIApiKey,
   getOpenAIModel,
@@ -120,11 +126,13 @@ const workflows: Record<WorkflowKey, WorkflowConfig> = {
     fields: ["Auth"],
     module: "k12-targets",
     prompt:
-      "Extract only the latest active voter-approved bond authorization or current bond authorization amount. Prefer CDIAC/DebtWatch, official ballot measure materials, district bond program pages, and board documents.",
+      "Extract only remaining unissued GO bond authorization outstanding, preferably by voter-approved election/measure. Report concise amounts still available, not the original total authorization unless the source also states the unissued remaining amount. Prefer Official Statements, CDIAC/DebtWatch, official ballot measure materials, district bond program pages, and board documents.",
     queries: (district: string) => [
-      `${district} California school district bond authorization measure amount CDIAC DebtWatch`,
+      `${district} remaining unissued GO bond authorization outstanding by election`,
+      `${district} California school district bond authorization remaining unissued amount CDIAC DebtWatch`,
       `"${district}" bond measure authorization amount`,
-      `"${district}" facilities bond program authorization`
+      `"${district}" unissued authorization official statement`,
+      `"${district}" facilities bond program remaining authorization`
     ],
     sourceProfile: "authorization"
   },
@@ -2027,9 +2035,9 @@ function buildL1DealFields(row: MuniDealFactRow, moduleKey: ModuleKey): Automati
   const underwriterFieldKey = moduleKey === "ccd-targets" ? "Underwriter" : "UW";
   const fieldValues: Array<[string, string | null]> = [
     ["Last Deal", formatL1DealSummary(row)],
-    ["MA", firstL1Value(row.ma, row.municipal_advisor)],
-    [underwriterFieldKey, firstL1Value(row.uw) ?? formatUnderwriters(row.underwriters)],
-    ["BC", firstL1Value(row.bc, row.bond_counsel)]
+    ["MA", formatDealTeamValue("MA", firstL1Value(row.ma, row.municipal_advisor))],
+    [underwriterFieldKey, formatDealTeamValue(underwriterFieldKey, firstL1Value(row.uw) ?? formatUnderwriters(row.underwriters))],
+    ["BC", formatDealTeamValue("BC", firstL1Value(row.bc, row.bond_counsel))]
   ];
 
   return fieldValues.flatMap(([fieldKey, value]) => {
@@ -2062,7 +2070,7 @@ function buildPlanDealFields(row: MuniDealFactRow): AutomationFieldResult[] {
   };
   const dealName = cleanL1Value(row.deal_name) ?? formatL1DealSummary(row);
   const fieldValues: Array<[string, string | null]> = [
-    ["MA", firstL1Value(row.ma, row.municipal_advisor)],
+    ["MA", formatDealTeamValue("MA", firstL1Value(row.ma, row.municipal_advisor))],
     ["Deal", dealName],
     ["Date", formatPlanSaleDate(row.deal_sale_date)],
     ["Par ($M)", formatParAmount(row.deal_par_amount) || null]
@@ -2100,17 +2108,13 @@ function formatPlanSaleDate(value: string | null | undefined) {
 }
 
 function formatL1DealSummary(row: MuniDealFactRow) {
-  const saleDate = formatSaleMonthYear(row.deal_sale_date);
-  const parAmount = formatParAmount(row.deal_par_amount);
-  const dealName = cleanL1Value(row.deal_name);
-  const dealType = cleanL1Value(row.deal_type);
-  const refundingType = cleanL1Value(row.refunding_type);
-  const suffix = uniqueStrings([refundingType, dealType].filter((value): value is string => Boolean(value))).join(" / ");
-  const nameWithType = suffix && dealName && !normalizeIdentityText(dealName).includes(normalizeIdentityText(suffix))
-    ? `${dealName} (${suffix})`
-    : dealName;
-
-  return [saleDate, parAmount, nameWithType].filter(Boolean).join(" - ");
+  return formatLastDealParts({
+    dealName: row.deal_name,
+    dealType: row.deal_type,
+    parAmount: row.deal_par_amount,
+    refundingType: row.refunding_type,
+    saleDate: row.deal_sale_date
+  });
 }
 
 function formatSaleMonthYear(value: string | null | undefined) {
@@ -3951,7 +3955,8 @@ Rules:
 - Do not infer names, titles, deal teams, or authorization amounts from stale or secondary sources.
 - When Board fields are requested, they should represent the current complete board roster when available, one current board member per field.
 - For Board fields, do not include former board members unless the source clearly says they are current.
-- When Last Deal is requested, it should be concise, usually date + amount + deal type.
+- When Last Deal is requested, return only date / par amount / NM or Ref. Use NM for new money and Ref for refunding. Example: "Apr 2026 / $397.505M / NM".
+- When Auth is requested, return remaining unissued GO bond authorization outstanding, preferably by election/measure. Keep it concise, for example "Measure J: $120M remaining; Measure N: $45M remaining".
 - Set confidence below 0.74 unless the evidence directly supports the value.
 
 Return JSON exactly in this shape:
@@ -4718,12 +4723,14 @@ function buildRejectedSuggestionDiagnostics(
   result: AutomationResearchResult,
   institution: string
 ) {
+  const moduleKey = workflows[workflowKey].module;
+
   return (result.fields ?? [])
     .slice(0, 5)
     .map((fieldResult) => {
       const fieldKey = fieldResult.field_key?.trim() ?? "";
-      const proposedValue = fieldResult.value?.trim() ?? "";
-      const currentValue = valueMap.get(`${recordId}::${fieldKey}`) ?? "";
+      const proposedValue = formatWorkbookFieldValue(moduleKey, fieldKey, fieldResult.value?.trim() ?? "");
+      const currentValue = formatWorkbookFieldValue(moduleKey, fieldKey, valueMap.get(`${recordId}::${fieldKey}`) ?? "");
       const confidence = normalizeConfidence(fieldResult.confidence);
       const minimumRequiredConfidence = minimumSuggestionConfidence(workflowKey);
       const sourceUrl = fieldResult.source_url?.trim() ?? "";
@@ -4744,7 +4751,7 @@ function buildRejectedSuggestionDiagnostics(
 
       reasons.push(...candidateWorkflowValidationReasons(workflowKey, fieldResult, institution));
 
-      if (valuesAreEquivalent(fieldKey, currentValue, proposedValue)) {
+      if (valuesAreEquivalent(moduleKey, fieldKey, currentValue, proposedValue)) {
         reasons.push(`same as current value "${trimText(currentValue, 60)}"`);
       }
 
@@ -4799,8 +4806,8 @@ function buildSuggestions(
 ): UpdateSuggestionInsert[] {
   const directSuggestions: UpdateSuggestionInsert[] = (result.fields ?? []).flatMap((fieldResult) => {
     const fieldKey = fieldResult.field_key?.trim() ?? "";
-    const proposedValue = fieldResult.value?.trim() ?? "";
-    const currentValue = valueMap.get(`${recordId}::${fieldKey}`) ?? "";
+    const proposedValue = formatWorkbookFieldValue(moduleKey, fieldKey, fieldResult.value?.trim() ?? "");
+    const currentValue = formatWorkbookFieldValue(moduleKey, fieldKey, valueMap.get(`${recordId}::${fieldKey}`) ?? "");
     const confidence = normalizeConfidence(fieldResult.confidence);
     const minimumRequiredConfidence = minimumSuggestionConfidence(workflowKey);
     const sourceUrl = fieldResult.source_url?.trim() ?? "";
@@ -4811,7 +4818,7 @@ function buildSuggestions(
       !allowedFields.includes(fieldKey) ||
       !proposedValue ||
       !isValidCandidateForWorkflow(workflowKey, fieldResult, institution) ||
-      valuesAreEquivalent(fieldKey, currentValue, proposedValue) ||
+      valuesAreEquivalent(moduleKey, fieldKey, currentValue, proposedValue) ||
       pendingSet.has(`${recordId}::${fieldKey}`) ||
       !sourceUrl ||
       !excerpt ||
@@ -5233,7 +5240,11 @@ function hasAnyPhrase(value: string, phrases: string[]) {
   return phrases.some((phrase) => value.includes(phrase));
 }
 
-function valuesAreEquivalent(fieldKey: string, currentValue: string, proposedValue: string) {
+function valuesAreEquivalent(moduleKey: ModuleKey, fieldKey: string, currentValue: string, proposedValue: string) {
+  if (equivalentFormattedValue(moduleKey, fieldKey, currentValue, proposedValue)) {
+    return true;
+  }
+
   const normalizedCurrent = normalizeComparableValue(currentValue);
   const normalizedProposed = normalizeComparableValue(proposedValue);
 

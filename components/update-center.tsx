@@ -87,9 +87,9 @@ const workflowGroups: Record<ModuleKey, WorkflowGroup[]> = {
     },
     {
       key: "authorization",
-      label: "Auth",
+      label: "Remaining Auth",
       fields: ["Auth"],
-      cadence: "Suggested manual cadence: quarterly for selected institutions.",
+      cadence: "Suggested manual cadence: quarterly for selected institutions. Looks for remaining unissued GO bond authorization by election/measure.",
       isAvailable: true
     }
   ],

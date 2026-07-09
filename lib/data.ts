@@ -52,7 +52,7 @@ export const moduleColumns: Record<ModuleKey, ColumnDef[]> = {
     { key: "MA", label: "MA", width: 190, fullName: "Municipal Advisor" },
     { key: "UW", label: "UW", width: 180, fullName: "Underwriter" },
     { key: "BC", label: "BC", width: 150, fullName: "Bond Counsel" },
-    { key: "Auth", label: "Auth", width: 120, fullName: "Authorization" },
+    { key: "Auth", label: "Remaining Auth", width: 150, fullName: "Remaining Authorization" },
     { key: "Last Deal", label: "Last Deal", width: 130 },
     { key: "Notes", label: "Notes", width: 280 },
     { key: "Sup", label: "Sup", width: 190, fullName: "Superintendent" },

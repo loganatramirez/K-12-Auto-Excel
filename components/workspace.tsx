@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 import { createSupabaseBrowserClient } from "@/lib/supabase/client";
 import { isSupabaseConfigured } from "@/lib/supabase/config";
+import { formatWorkbookFieldValue } from "@/lib/deal-formatting";
 import {
   getLastUpdated,
   getModuleRows,
@@ -22,6 +23,7 @@ import {
   type ModuleKey,
   type WorkspaceRecord
 } from "@/lib/data";
+import { exportWorkbookXlsx } from "@/lib/workbook-export";
 import { WorkbookSidebar } from "./workbook-sidebar";
 
 type FilterState = {
@@ -531,9 +533,9 @@ function SheetToolbar({
       </button>
       <button
         className="icon-action strong"
-        onClick={() => exportCsv(filteredRows, columns, moduleKey)}
-        title="Export CSV"
-        aria-label="Export CSV"
+        onClick={() => exportWorkbookXlsx(filteredRows, columns, moduleKey)}
+        title="Export Excel"
+        aria-label="Export Excel"
       >
         <Download size={18} />
       </button>
@@ -687,17 +689,23 @@ function applyComputedFields(
   fields: Record<string, FieldValue>
 ) {
   if (moduleKey !== "plans" || rowKind === "section") {
-    return fields;
+    return applyDisplayFormatting(moduleKey, fields);
   }
 
   const estimatedRevenue = calculateEstimatedRevenue(fields);
   const adjustedRevenue = calculateAdjustedRevenue(estimatedRevenue, fields);
 
-  return {
+  return applyDisplayFormatting(moduleKey, {
     ...fields,
     "EST Rev": estimatedRevenue === null ? "" : formatRevenueThousands(estimatedRevenue),
     "ADJ Rev": adjustedRevenue === null ? "" : formatRevenueThousands(adjustedRevenue)
-  };
+  });
+}
+
+function applyDisplayFormatting(moduleKey: ModuleKey, fields: Record<string, FieldValue>) {
+  return Object.fromEntries(
+    Object.entries(fields).map(([key, value]) => [key, formatWorkbookFieldValue(moduleKey, key, value)])
+  );
 }
 
 function calculateEstimatedRevenue(fields: Record<string, FieldValue>) {
@@ -788,7 +796,11 @@ function columnName(index: number) {
 function buildCsv(rows: WorkspaceRecord[], columns: Array<{ key: string; label: string }>) {
   return [
     columns.map((column) => csvEscape(column.label)).join(","),
-    ...rows.map((row) => columns.map((column) => csvEscape(row.fields[column.key] ?? "")).join(","))
+    ...rows.map((row) =>
+      columns
+        .map((column) => csvEscape(formatWorkbookFieldValue(row.module, column.key, row.fields[column.key] ?? "")))
+        .join(",")
+    )
   ].join("\n");
 }
 
