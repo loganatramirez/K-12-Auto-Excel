@@ -7,6 +7,10 @@ This is a working Next.js workbook for three Excel-like sheets plus an update re
 - FY25&26
 - Update Center
 
+For the full operator handoff, monthly CDIAC refresh steps, Supabase/Vercel
+checks, and troubleshooting guide, see
+[`docs/logan-project-handoff.md`](docs/logan-project-handoff.md).
+
 The fixed target lists live in `lib/data.ts`. Supabase stores the parts that can change:
 
 - saved field edits
