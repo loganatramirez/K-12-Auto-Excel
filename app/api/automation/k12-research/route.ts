@@ -126,14 +126,8 @@ const workflows: Record<WorkflowKey, WorkflowConfig> = {
     fields: ["Auth"],
     module: "k12-targets",
     prompt:
-      "Extract only remaining unissued GO bond authorization outstanding, preferably by voter-approved election/measure. Report concise amounts still available, not the original total authorization unless the source also states the unissued remaining amount. Prefer Official Statements, CDIAC/DebtWatch, official ballot measure materials, district bond program pages, and board documents.",
-    queries: (district: string) => [
-      `${district} remaining unissued GO bond authorization outstanding by election`,
-      `${district} California school district bond authorization remaining unissued amount CDIAC DebtWatch`,
-      `"${district}" bond measure authorization amount`,
-      `"${district}" unissued authorization official statement`,
-      `"${district}" facilities bond program remaining authorization`
-    ],
+      "Extract only remaining unissued GO bond authorization outstanding, preferably by voter-approved election/measure. Prefer the latest Official Statement/POS/offering document tied to the saved Last Deal because those documents often include an authorization table. Report concise amounts still available with an as-of/source date. Do not report original bond measure authorization unless the same source also states the unissued remaining amount.",
+    queries: k12AuthorizationQueries,
     sourceProfile: "authorization"
   },
   "ccd-deal-facts": {
@@ -176,7 +170,11 @@ const workflows: Record<WorkflowKey, WorkflowConfig> = {
 };
 
 function valueFieldsForWorkflow(workflowKey: WorkflowKey, fields: readonly string[]) {
-  return workflows[workflowKey].sourceProfile === "deal-team" ? uniqueStrings([...fields, "Last Deal"]) : [...fields];
+  const sourceProfile = workflows[workflowKey].sourceProfile;
+
+  return sourceProfile === "deal-team" || sourceProfile === "authorization"
+    ? uniqueStrings([...fields, "Last Deal"])
+    : [...fields];
 }
 
 function k12DealTeamQueries(district: string) {
@@ -815,8 +813,37 @@ type DebtWatchIssueRecord = Record<string, unknown> & {
   SaleDate?: string | null;
 };
 
+type DebtWatchAuthorizationRecord = Record<string, unknown> & {
+  ADTRReportingYearEnd?: number | string | null;
+  AuthAmountEndPeriod?: number | string | null;
+  AuthAuthorizationAdded?: number | string | null;
+  AuthDate?: string | null;
+  AuthIssuance?: number | string | null;
+  AuthName?: string | null;
+  AuthOriginalAmount?: number | string | null;
+};
+
+type DebtWatchDocumentRecord = Record<string, unknown> & {
+  DocumentFileName?: string | null;
+  DocumentFileURL?: string | null;
+  DocumentId?: number | string | null;
+  DocumentType?: string | null;
+  PrincipalAmount?: number | string | null;
+  ProjectSeriesOrName?: string | null;
+  SaleDate?: string | null;
+};
+
 type DebtWatchIssuanceDetailResponse = {
   datasetById?: {
+    "adtr-auths"?: {
+      recordSets?: Array<{
+        records?: DebtWatchAuthorizationRecord[];
+        reportingYearId?: number | string | null;
+      }>;
+    };
+    documents?: {
+      records?: DebtWatchDocumentRecord[];
+    };
     issues?: {
       record?: DebtWatchIssueRecord;
     };
@@ -1136,6 +1163,32 @@ async function researchInstitution(
     };
   }
 
+  if (sourceProfile === "authorization") {
+    const debtWatchAuthResult = await researchAuthorizationFromDebtWatch(
+      institution,
+      savedLastDeal,
+      extractors
+    );
+
+    if (debtWatchAuthResult?.fields?.length) {
+      return debtWatchAuthResult;
+    }
+
+    if (!sourceSearchConfigs.length || !extractors.length) {
+      return (
+        debtWatchAuthResult ?? {
+          candidate_diagnostics: [
+            savedLastDeal
+              ? `No CDIAC/DebtWatch OS or ADTR remaining authorization evidence was found for saved Last Deal "${savedLastDeal}".`
+              : "No saved Last Deal is available to locate a CDIAC OS/POS for remaining authorization."
+          ],
+          fields: [],
+          source_count: 0
+        }
+      );
+    }
+  }
+
   if (!sourceSearchConfigs.length || !extractors.length) {
     return {
       ...(l1DealResult ?? { fields: [], source_count: 0 }),
@@ -1148,11 +1201,15 @@ async function researchInstitution(
     };
   }
 
+  const sourceQueries = sourceProfile === "authorization"
+    ? authorizationQueriesForLastDeal(institution, savedLastDeal, workflows[workflowKey].queries(institution))
+    : undefined;
   const searchResult = await researchInstitutionFromSources(
     institution,
     workflowKey,
     sourceSearchConfigs,
-    extractors
+    extractors,
+    sourceQueries
   );
 
   if (!l1DealResult) {
@@ -1166,12 +1223,13 @@ async function researchInstitutionFromSources(
   institution: string,
   workflowKey: WorkflowKey,
   sourceSearchConfigs: SourceSearchConfig[],
-  extractors: ExtractorConfig[]
+  extractors: ExtractorConfig[],
+  queries = workflows[workflowKey].queries(institution)
 ): Promise<AutomationResearchResult> {
   const workflow = workflows[workflowKey];
   const sourceDiscovery = await discoverSources(
     institution,
-    workflow.queries(institution),
+    queries,
     sourceSearchConfigs,
     workflowKey
   );
@@ -1669,6 +1727,292 @@ function scoreDebtWatchIssueRecord(
   );
 }
 
+async function researchAuthorizationFromDebtWatch(
+  institution: string,
+  lastDeal: string,
+  extractors: ExtractorConfig[]
+): Promise<AutomationResearchResult | null> {
+  if (!lastDeal.trim()) {
+    return null;
+  }
+
+  const matchedIssue = await findDebtWatchIssueForLastDeal(institution, lastDeal);
+
+  if (!matchedIssue) {
+    return {
+      candidate_diagnostics: [
+        `Could not match saved Last Deal "${lastDeal}" to a CDIAC/DebtWatch issue, so no CDIAC OS/POS was opened.`
+      ],
+      fields: [],
+      source_count: 0
+    };
+  }
+
+  const detail = await fetchDebtWatchIssuanceDetail(matchedIssue.cdiacNumber);
+
+  if (!detail) {
+    return {
+      candidate_diagnostics: [
+        `Matched saved Last Deal to CDIAC ${matchedIssue.cdiacNumber}, but the DebtWatch detail report could not be loaded.`
+      ],
+      fields: [],
+      source_candidates: [debtWatchIssueSourceCandidate(matchedIssue.cdiacNumber, institution)],
+      source_count: matchedIssue.searchedCount
+    };
+  }
+
+  const adtrField = buildDebtWatchAuthorizationField(detail, matchedIssue.cdiacNumber);
+
+  if (adtrField) {
+    return {
+      candidate_diagnostics: [
+        `CDIAC ${matchedIssue.cdiacNumber} ADTR authorization records supplied remaining authorization from the latest reporting year.`
+      ],
+      fields: [adtrField],
+      source_candidates: [debtWatchIssueSourceCandidate(matchedIssue.cdiacNumber, institution)],
+      source_count: matchedIssue.searchedCount
+    };
+  }
+
+  const osSources = debtWatchOfficialStatementSources(detail, matchedIssue.cdiacNumber);
+
+  if (!osSources.length) {
+    return {
+      candidate_diagnostics: [
+        `CDIAC ${matchedIssue.cdiacNumber} was matched, but DebtWatch documents did not include an OS/POS file type.`
+      ],
+      fields: [],
+      source_candidates: [debtWatchIssueSourceCandidate(matchedIssue.cdiacNumber, institution)],
+      source_count: matchedIssue.searchedCount
+    };
+  }
+
+  if (!extractors.length) {
+    return {
+      candidate_diagnostics: [
+        `CDIAC ${matchedIssue.cdiacNumber} has OS/POS documents, but no extractor is configured to read them.`
+      ],
+      fields: [],
+      source_candidates: osSources.map((source) => sourceCandidateFromSearchSource(source, "kept")),
+      source_count: osSources.length
+    };
+  }
+
+  const expandedSources = await expandSources(osSources, "authorization");
+  const input = {
+    institution,
+    fields: workflows.authorization.fields,
+    prompt: workflows.authorization.prompt,
+    sourceList: buildSourceList(expandedSources)
+  };
+  const response = await extractFields(input, extractors[0]);
+  const parsed = parseJsonObject(response) as AutomationResearchResult;
+  const result = attachSourceMetadata(parsed, expandedSources, extractors[0].provider);
+
+  return {
+    ...result,
+    candidate_diagnostics: mergeCandidateDiagnostics([
+      ...(result.candidate_diagnostics ?? []),
+      `Opened ${osSources.length} CDIAC OS/POS document${osSources.length === 1 ? "" : "s"} for CDIAC ${matchedIssue.cdiacNumber}.`
+    ]),
+    source_candidates: osSources.map((source) => sourceCandidateFromSearchSource(source, "kept")),
+    source_count: osSources.length
+  };
+}
+
+async function findDebtWatchIssueForLastDeal(institution: string, lastDeal: string) {
+  const directCdiacNumber = extractCdiacNumbers(lastDeal)[0];
+  const directIssueRecord = directCdiacNumber ? await fetchDebtWatchIssueRecord(directCdiacNumber) : null;
+  const searchedIssueRecords = directIssueRecord
+    ? [directIssueRecord]
+    : await searchDebtWatchIssuesForLastDeal(institution, lastDeal);
+  const bestIssueRecord = chooseDebtWatchIssueRecord(searchedIssueRecords, institution, lastDeal);
+  const cdiacNumber = debtWatchText(bestIssueRecord?.CDIACNumber);
+
+  if (!bestIssueRecord || !cdiacNumber) {
+    return null;
+  }
+
+  return {
+    cdiacNumber,
+    issueRecord: bestIssueRecord,
+    searchedCount: searchedIssueRecords.length
+  };
+}
+
+function buildDebtWatchAuthorizationField(
+  detail: DebtWatchIssuanceDetailResponse,
+  cdiacNumber: string
+): AutomationFieldResult | null {
+  const recordSets = detail.datasetById?.["adtr-auths"]?.recordSets ?? [];
+  const authRows = recordSets.flatMap((recordSet) =>
+    (recordSet.records ?? []).map((record) => ({
+      record,
+      reportingYear: Number(record.ADTRReportingYearEnd ?? recordSet.reportingYearId)
+    }))
+  );
+  const latestReportingYear = Math.max(0, ...authRows.map((row) => row.reportingYear).filter(Number.isFinite));
+  const latestRows = authRows
+    .filter((row) => row.reportingYear === latestReportingYear)
+    .filter((row) => {
+      const remainingAmount = debtWatchNumber(row.record.AuthAmountEndPeriod);
+
+      return remainingAmount !== null && remainingAmount > 0;
+    });
+
+  if (!latestRows.length) {
+    return null;
+  }
+
+  const value = latestRows
+    .map((row) => {
+      const authName = debtWatchText(row.record.AuthName) ?? "Authorization";
+      const remainingAmount = debtWatchNumber(row.record.AuthAmountEndPeriod);
+
+      return `${authName}: ${formatParAmount(remainingAmount)} remaining as of ${row.reportingYear} CDIAC ADTR`;
+    })
+    .join("; ");
+  const excerpt = latestRows
+    .map((row) => {
+      const authName = debtWatchText(row.record.AuthName) ?? "Authorization";
+      const originalAmount = formatParAmount(debtWatchNumber(row.record.AuthOriginalAmount));
+      const issuedAmount = formatParAmount(debtWatchNumber(row.record.AuthIssuance));
+      const remainingAmount = formatParAmount(debtWatchNumber(row.record.AuthAmountEndPeriod));
+
+      return `${authName}: original authorization ${originalAmount || "n/a"}; issued ${issuedAmount || "n/a"}; remaining authorization/end-period amount ${remainingAmount}; reporting year ${row.reportingYear}.`;
+    })
+    .join(" ");
+
+  return {
+    confidence: 0.94,
+    excerpt,
+    field_key: "Auth",
+    source_context: "CDIAC DebtWatch ADTR authorization records",
+    source_title: `CDIAC DebtWatch ADTR authorization ${cdiacNumber}`,
+    source_url: debtWatchIssueReportUrl(cdiacNumber),
+    value
+  };
+}
+
+function debtWatchOfficialStatementSources(detail: DebtWatchIssuanceDetailResponse, cdiacNumber: string): SearchSource[] {
+  const documents = detail.datasetById?.documents?.records ?? [];
+
+  return documents
+    .filter(isOfficialStatementDocument)
+    .slice(0, 4)
+    .map((document, index) => {
+      const documentType = debtWatchText(document.DocumentType) ?? "OS/POS";
+      const fileName = debtWatchText(document.DocumentFileName) ?? `CDIAC document ${document.DocumentId ?? index + 1}`;
+      const url = debtWatchText(document.DocumentFileURL) ?? "";
+      const saleDate = formatPlanSaleDate(debtWatchDate(document.SaleDate));
+      const principalAmount = formatParAmount(debtWatchNumber(document.PrincipalAmount));
+
+      return {
+        index: index + 1,
+        snippet: [
+          `CDIAC ${cdiacNumber}`,
+          documentType,
+          fileName,
+          saleDate ? `Sale date ${saleDate}` : "",
+          principalAmount ? `Principal amount ${principalAmount}` : "",
+          "Read for remaining/unissued authorization table."
+        ]
+          .filter(Boolean)
+          .join("; "),
+        title: `CDIAC ${documentType}: ${fileName}`,
+        url
+      };
+    })
+    .filter((source) => Boolean(source.url));
+}
+
+function isOfficialStatementDocument(document: DebtWatchDocumentRecord) {
+  const haystack = normalizeIdentityText(
+    [document.DocumentType, document.DocumentFileName].filter(Boolean).join(" ")
+  );
+
+  return hasAnyPhrase(haystack, [
+    "official statement",
+    "preliminary official statement",
+    "pos",
+    "offering document"
+  ]);
+}
+
+function debtWatchIssueSourceCandidate(cdiacNumber: string, institution: string): SourceCandidateDiagnostic {
+  const url = debtWatchIssueReportUrl(cdiacNumber);
+
+  return {
+    category: "cdiac_debtwatch",
+    reason: `Matched ${institution} saved Last Deal to CDIAC ${cdiacNumber}.`,
+    score: 100,
+    snippet: `CDIAC ${cdiacNumber} issue detail.`,
+    status: "kept",
+    title: `CDIAC DebtWatch issue ${cdiacNumber}`,
+    url
+  };
+}
+
+function sourceCandidateFromSearchSource(
+  source: SearchSource,
+  status: SourceCandidateDiagnostic["status"]
+): SourceCandidateDiagnostic {
+  return {
+    category: dealSourceCategory(source),
+    reason: "Kept because CDIAC document file type is OS/POS.",
+    score: scoreSource(source, "authorization"),
+    snippet: trimText(source.snippet, 280),
+    status,
+    title: trimText(source.title, 110),
+    url: source.url
+  };
+}
+
+function k12AuthorizationQueries(district: string) {
+  const aliases = k12SearchAliases(district);
+  const primaryAlias = aliases[0] ?? district;
+  const years = ["2026", "2025", "2024", "2023"];
+  const recentOfficialStatementQueries = years.flatMap((year) => [
+    `${primaryAlias} ${year} official statement remaining authorization unissued authorization`,
+    `${primaryAlias} ${year} preliminary official statement unissued GO bond authorization`
+  ]);
+
+  return uniqueStrings([
+    `${primaryAlias} official statement remaining unissued GO bond authorization`,
+    `${primaryAlias} preliminary official statement remaining authorization table`,
+    `${primaryAlias} EMMA official statement remaining authorization unissued authorization`,
+    `${primaryAlias} POS PDF unissued authorization remaining authorization`,
+    `${primaryAlias} "authorization remaining" "official statement"`,
+    `${primaryAlias} "authorized but unissued" "official statement"`,
+    `${primaryAlias} "remaining authorization" "GO bonds"`,
+    `${primaryAlias} "unissued authorization" "GO bonds"`,
+    `${primaryAlias} bond program remaining unissued authorization`,
+    `${primaryAlias} GO bond elections unissued authorization outstanding`,
+    ...recentOfficialStatementQueries
+  ]);
+}
+
+function authorizationQueriesForLastDeal(institution: string, savedLastDeal: string, baseQueries: string[]) {
+  const lastDeal = savedLastDeal.trim();
+
+  if (!lastDeal) {
+    return baseQueries;
+  }
+
+  const latestYear = Math.max(0, ...extractYears(lastDeal));
+  const amount = lastDeal.match(/\$\s?\d[\d,]*(?:\.\d+)?\s?(?:million|mm|m)?/i)?.[0] ?? "";
+  const dealKind = hasAnyPhrase(normalizeIdentityText(lastDeal), ["ref", "refunding"]) ? "refunding" : "new money";
+  const lastDealQueries = [
+    `${institution} ${lastDeal} official statement remaining authorization`,
+    latestYear ? `${institution} ${latestYear} official statement unissued authorization remaining authorization` : "",
+    latestYear ? `${institution} ${latestYear} preliminary official statement authorized but unissued` : "",
+    amount ? `${institution} ${amount} official statement remaining authorization` : "",
+    `${institution} ${dealKind} bonds official statement remaining authorization`
+  ].filter(Boolean);
+
+  return uniqueStrings([...lastDealQueries, ...baseQueries]);
+}
+
 function extractCdiacNumbers(value: string) {
   return uniqueStrings(Array.from(value.matchAll(/\b20\d{2}-\d{4}\b/g)).map((match) => match[0]));
 }
@@ -1704,6 +2048,12 @@ function amountsAreClose(left: number, right: number) {
 }
 
 async function fetchDebtWatchIssueRecord(cdiacNumber: string) {
+  const data = await fetchDebtWatchIssuanceDetail(cdiacNumber);
+
+  return data?.datasetById?.issues?.record ?? null;
+}
+
+async function fetchDebtWatchIssuanceDetail(cdiacNumber: string) {
   try {
     const response = await fetch(
       `${debtWatchApiBaseUrl}/report/issuance-detail-with-history/${encodeURIComponent(cdiacNumber)}`,
@@ -1722,7 +2072,7 @@ async function fetchDebtWatchIssueRecord(cdiacNumber: string) {
 
     const data = (await response.json()) as DebtWatchIssuanceDetailResponse;
 
-    return data.datasetById?.issues?.record ?? null;
+    return data;
   } catch {
     return null;
   }
@@ -2827,6 +3177,10 @@ function sourceCandidateReason(
   workflowKey: WorkflowKey
 ) {
   if (status === "kept") {
+    if (workflows[workflowKey].sourceProfile === "authorization") {
+      return `Ranked as ${sourceCategoryLabel(sourceCandidateCategory(source, workflowKey))}; kept only if it can support remaining/unissued authorization.`;
+    }
+
     if (workflows[workflowKey].sourceProfile === "deal-team") {
       return `Ranked as ${sourceCategoryLabel(sourceCandidateCategory(source, workflowKey))}; kept for PDF/page reading and extraction.`;
     }
@@ -2835,6 +3189,10 @@ function sourceCandidateReason(
   }
 
   if (status === "not_selected") {
+    if (workflows[workflowKey].sourceProfile === "authorization") {
+      return `Matched the district, but ranked below stronger CDIAC/OS/POS remaining-authorization sources.`;
+    }
+
     if (workflows[workflowKey].sourceProfile === "deal-team") {
       return `Matched the institution as ${sourceCategoryLabel(sourceCandidateCategory(source, workflowKey))}, but ranked below the top ${mergedSourceLimit(workflowKey)} sources for extraction.`;
     }
@@ -2844,7 +3202,7 @@ function sourceCandidateReason(
 
   const sourceProfile = workflows[workflowKey].sourceProfile;
 
-  if (sourceProfile === "k12-leadership" || sourceProfile === "deal-team") {
+  if (sourceProfile === "k12-leadership" || sourceProfile === "deal-team" || sourceProfile === "authorization") {
     const sourceHost = sourceHostName(source.url);
     const entityName = workflows[workflowKey].module === "ccd-targets" ? "CCD" : "district";
     const domains = workflows[workflowKey].module === "ccd-targets"
@@ -2862,7 +3220,11 @@ function sourceCandidateReason(
 }
 
 function sourceCandidateCategory(source: SearchSource, workflowKey: WorkflowKey): SourceCandidateCategory {
-  return workflows[workflowKey].sourceProfile === "deal-team" ? dealSourceCategory(source) : "supplemental";
+  const sourceProfile = workflows[workflowKey].sourceProfile;
+
+  return sourceProfile === "deal-team" || sourceProfile === "authorization"
+    ? dealSourceCategory(source)
+    : "supplemental";
 }
 
 function dealSourceCategory(source: SearchSource): SourceCandidateCategory {
@@ -2982,6 +3344,7 @@ function mergeSourcesIntoMap(
 
 function shouldRunAssistantSourceSearch(workflowKey: WorkflowKey, mergedSources: Map<string, SearchSource>) {
   if (
+    workflows[workflowKey].sourceProfile === "authorization" ||
     workflows[workflowKey].sourceProfile === "ccd-leadership" ||
     workflows[workflowKey].sourceProfile === "deal-team" ||
     workflows[workflowKey].sourceProfile === "k12-leadership"
@@ -3025,6 +3388,10 @@ function filterSourcesForInstitution(sources: SearchSource[], institution: strin
 
   if (sourceProfile === "deal-team" && moduleKey === "ccd-targets") {
     return sources.filter((source) => sourceMatchesCcdInstitution(source, institution));
+  }
+
+  if (sourceProfile === "authorization") {
+    return sources.filter((source) => sourceMatchesK12Institution(source, institution));
   }
 
   if (sourceProfile !== "k12-leadership" && sourceProfile !== "deal-team") {
@@ -3209,7 +3576,7 @@ function sourceSearchProfileInstruction(workflowKey: WorkflowKey) {
   }
 
   if (sourceProfile === "authorization") {
-    return "Find official or high-quality sources for the current California school district bond authorization amount. Prefer CDIAC/DebtWatch, official ballot measure materials, district bond program pages, board materials, and election documents.";
+    return "Find current remaining/unissued GO bond authorization evidence for a California school district. Prefer CDIAC/DebtWatch issue detail documents where DocumentType/FileType is Official Statement, Preliminary Official Statement, POS, or Offering Document, especially for the latest saved Last Deal. Also use recent official statements, POS PDFs, EMMA/offering documents, or current bond program pages that explicitly state remaining/unissued authorization. Do not use old election or ballot measure documents as final support unless they also state remaining/unissued authorization.";
   }
 
   return "Find official current source pages that can support the requested public finance workbook fields.";
@@ -3956,7 +4323,7 @@ Rules:
 - When Board fields are requested, they should represent the current complete board roster when available, one current board member per field.
 - For Board fields, do not include former board members unless the source clearly says they are current.
 - When Last Deal is requested, return only date / par amount / NM or Ref. Use NM for new money and Ref for refunding. Example: "Apr 2026 / $397.505M / NM".
-- When Auth is requested, return remaining unissued GO bond authorization outstanding, preferably by election/measure. Keep it concise, for example "Measure J: $120M remaining; Measure N: $45M remaining".
+- When Auth is requested, return only remaining/unissued GO bond authorization outstanding, preferably by election/measure. Prefer CDIAC ADTR auth records or the latest OS/POS/offering document. Include an as-of/source date such as "Measure J: $120M remaining as of 2025 OS". If sources only show original authorization, bond measure amount, election result, or maximum bonded indebtedness without remaining/unissued authorization, omit the field.
 - Set confidence below 0.74 unless the evidence directly supports the value.
 
 Return JSON exactly in this shape:
@@ -4787,6 +5154,10 @@ function candidateWorkflowValidationReasons(
   candidate: AutomationFieldResult,
   institution: string
 ) {
+  if (workflows[workflowKey].sourceProfile === "authorization") {
+    return authorizationValidationReasons(candidate);
+  }
+
   if (workflows[workflowKey].sourceProfile !== "deal-team") {
     return [];
   }
@@ -5073,6 +5444,10 @@ function isUnderwriterField(fieldKey: string) {
 }
 
 function isValidCandidateForWorkflow(workflowKey: WorkflowKey, candidate: AutomationFieldResult, institution: string) {
+  if (workflows[workflowKey].sourceProfile === "authorization") {
+    return authorizationValidationReasons(candidate).length === 0;
+  }
+
   if (workflows[workflowKey].sourceProfile !== "deal-team") {
     return true;
   }
@@ -5082,6 +5457,41 @@ function isValidCandidateForWorkflow(workflowKey: WorkflowKey, candidate: Automa
 
 function isValidDealTeamCandidate(candidate: AutomationFieldResult, institution: string, packageContext?: string) {
   return dealTeamValidationReasons(candidate, institution, packageContext).length === 0;
+}
+
+function authorizationValidationReasons(candidate: AutomationFieldResult) {
+  const fieldKey = candidate.field_key?.trim() ?? "";
+  const value = candidate.value?.trim() ?? "";
+  const evidenceText = [
+    value,
+    candidate.excerpt,
+    candidate.source_title,
+    candidate.source_url,
+    candidate.source_context,
+    candidate.package_context
+  ]
+    .filter(Boolean)
+    .join(" ");
+  const normalizedEvidence = normalizeIdentityText(evidenceText);
+  const reasons: string[] = [];
+
+  if (fieldKey !== "Auth" || !value) {
+    return ["missing authorization field or value"];
+  }
+
+  if (!hasRemainingAuthorizationEvidence(normalizedEvidence)) {
+    if (hasAnyPhrase(normalizedEvidence, ["bond measure", "election", "voter approved", "maximum bonded indebtedness"])) {
+      reasons.push("Only original authorization found; no remaining unissued amount supported.");
+    } else {
+      reasons.push("no remaining/unissued authorization evidence");
+    }
+  }
+
+  if (!/(\$\s?\d|\b\d+(?:\.\d+)?\s?(?:m|mm|million)\b)/i.test(value)) {
+    reasons.push("authorization value lacks an amount");
+  }
+
+  return reasons;
 }
 
 function dealTeamValidationReasons(candidate: AutomationFieldResult, institution: string, packageContext?: string) {
@@ -5238,6 +5648,21 @@ function hasRoleEvidence(normalizedFieldEvidence: string, normalizedEvidence: st
 
 function hasAnyPhrase(value: string, phrases: string[]) {
   return phrases.some((phrase) => value.includes(phrase));
+}
+
+function hasRemainingAuthorizationEvidence(value: string) {
+  const normalizedValue = normalizeIdentityText(value);
+
+  return hasAnyPhrase(normalizedValue, [
+    "authorization remaining",
+    "remaining authorization",
+    "unissued authorization",
+    "authorized but unissued",
+    "amounts authorized but unissued",
+    "authorization end period",
+    "authamountendperiod",
+    "remaining authorization end period"
+  ]);
 }
 
 function valuesAreEquivalent(moduleKey: ModuleKey, fieldKey: string, currentValue: string, proposedValue: string) {
@@ -5747,23 +6172,41 @@ function scoreSource(source: SearchSource, workflowKey: WorkflowKey) {
   }
 
   if (sourceProfile === "authorization") {
+    score += dealSourceCategoryScore(dealSourceCategory(source));
+    score += dealYearScore(latestDealYearFromText(haystack)) / 5;
     score += keywordScore(haystack, [
-      ["authorization", 5],
-      ["authorized", 4],
-      ["remaining authorization", 7],
-      ["unissued authorization", 7],
-      ["bond measure", 5],
-      ["measure", 3],
-      ["cdiac", 5],
-      ["debtwatch", 5],
-      ["facilities bond", 4],
-      ["voter-approved", 4],
-      ["voter approved", 4],
-      ["election", 3],
+      ["official statement", 14],
+      ["preliminary official statement", 14],
+      ["offering document", 12],
+      ["emma", 10],
+      ["cdiac", 10],
+      ["debtwatch", 10],
+      ["authorization remaining", 14],
+      ["remaining authorization", 14],
+      ["unissued authorization", 14],
+      ["authorized but unissued", 13],
+      ["amounts authorized but unissued", 13],
+      ["authorization table", 10],
+      ["authorization", 4],
+      ["authorized", 3],
+      ["bond measure", 3],
+      ["measure", 1],
+      ["facilities bond", 3],
+      ["voter-approved", 2],
+      ["voter approved", 2],
+      ["election", 1],
       ["maximum bonded indebtedness", 4],
-      ["proposition 39", 3],
+      ["proposition 39", 2],
       ["55%", 2]
     ]);
+
+    if (
+      hasAnyPhrase(haystack, ["election", "bond measure", "voter approved", "voter-approved"]) &&
+      !hasRemainingAuthorizationEvidence(haystack) &&
+      !hasAnyPhrase(haystack, ["official statement", "preliminary official statement", "offering document"])
+    ) {
+      score -= 12;
+    }
   }
 
   return score;
