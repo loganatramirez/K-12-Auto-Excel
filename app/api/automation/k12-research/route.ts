@@ -70,6 +70,7 @@ const blockedSourceHosts = [
 type SourceProfile =
   | "authorization"
   | "ccd-leadership"
+  | "ccd-refundings"
   | "deal-team"
   | "k12-leadership"
   | "last-deal"
@@ -90,6 +91,7 @@ type WorkflowKey =
   | "ccd-deal-facts"
   | "ccd-deal-team"
   | "ccd-leadership"
+  | "ccd-refundings"
   | "deal-team"
   | "last-deal"
   | "leadership"
@@ -137,6 +139,14 @@ const workflows: Record<WorkflowKey, WorkflowConfig> = {
       "Use the local CDIAC/DebtWatch deal-facts dataset to propose only the latest supported bond/debt transaction for the exact California community college district. Do not extract Underwriter, MA, BC, Chancellor, CFO, or other roles in this workflow.",
     queries: ccdDealTeamQueries,
     sourceProfile: "last-deal"
+  },
+  "ccd-refundings": {
+    fields: ["Refundings"],
+    module: "ccd-targets",
+    prompt:
+      "Use the local CDIAC/DebtWatch deal-facts dataset to propose only the latest supported refunding transaction for the exact California community college district. Prefer DebtWatch Refunding Amount when available; otherwise use par amount only when the issue name or refunding type directly identifies the deal as a refunding.",
+    queries: ccdDealTeamQueries,
+    sourceProfile: "ccd-refundings"
   },
   "ccd-deal-team": {
     fields: ["Underwriter", "MA", "BC"],
@@ -790,6 +800,7 @@ type MuniDealFactRow = {
   municipal_advisor?: string | null;
   record_id?: string | null;
   related_entity_name?: string | null;
+  refunding_amount?: number | string | null;
   refunding_type?: string | null;
   source_excerpt?: string | null;
   source_layer?: string | null;
@@ -1122,6 +1133,18 @@ async function researchInstitution(
     return (
       planDealResult ?? {
         candidate_diagnostics: [`No CDIAC/DebtWatch plan deal fact is loaded for ${institution}.`],
+        fields: [],
+        source_count: 0
+      }
+    );
+  }
+
+  if (sourceProfile === "ccd-refundings") {
+    const refundingResult = await researchCcdRefundingsFromL1(supabase, moduleKey, recordId, institution);
+
+    return (
+      refundingResult ?? {
+        candidate_diagnostics: [`No CDIAC/DebtWatch refunding deal fact is loaded for ${institution}.`],
         fields: [],
         source_count: 0
       }
@@ -1507,6 +1530,85 @@ async function researchPlanDealFactsFromL1(
     fields,
     source_candidates: [l1SourceCandidate(enrichedLatestDeal, institution)],
     source_count: 1
+  };
+}
+
+async function researchCcdRefundingsFromL1(
+  supabase: SupabaseServerClient,
+  moduleKey: ModuleKey,
+  recordId: string,
+  institution: string
+): Promise<AutomationResearchResult | null> {
+  const selectColumns = muniDealFactSelectColumns();
+
+  const { data, error } = await supabase
+    .from("muni_deal_facts")
+    .select(selectColumns)
+    .eq("module", moduleKey)
+    .eq("record_id", recordId)
+    .eq("scope_included", true)
+    .gte("deal_sale_date", `${minimumDealYear}-01-01`)
+    .order("deal_sale_date", { ascending: false })
+    .limit(12);
+
+  if (error) {
+    if (isMissingMuniPipelineTableError(error)) {
+      return null;
+    }
+
+    return {
+      candidate_diagnostics: [`CCD refunding lookup failed: ${error.message}`],
+      fields: [],
+      source_count: 0
+    };
+  }
+
+  const rows = (data ?? []) as MuniDealFactRow[];
+  const candidateRows = rows.length
+    ? rows
+    : (await researchDealTeamFromL1ByInstitution(supabase, moduleKey, institution, selectColumns)).slice(0, 12);
+
+  if (!candidateRows.length) {
+    return null;
+  }
+
+  const enrichedRows = await Promise.all(candidateRows.map(enrichL1DealFromDebtWatch));
+  const refundingRows = enrichedRows
+    .filter(isRefundingDealRow)
+    .sort((left, right) => String(right.deal_sale_date ?? "").localeCompare(String(left.deal_sale_date ?? "")));
+  const latestRefunding = refundingRows[0];
+
+  if (!latestRefunding) {
+    return {
+      candidate_diagnostics: [
+        `Checked ${candidateRows.length} recent CDIAC/DebtWatch deal fact${candidateRows.length === 1 ? "" : "s"} for ${institution}, but none had a supported Refunding Amount or refunding label.`
+      ],
+      fields: [],
+      source_candidates: enrichedRows.slice(0, 5).map((row) => l1SourceCandidate(row, institution)),
+      source_count: candidateRows.length
+    };
+  }
+
+  const field = buildCcdRefundingsField(latestRefunding);
+
+  if (!field) {
+    return {
+      candidate_diagnostics: [
+        `Found a refunding deal for ${institution}, but it did not include a usable refunding or par amount.`
+      ],
+      fields: [],
+      source_candidates: [l1SourceCandidate(latestRefunding, institution)],
+      source_count: candidateRows.length
+    };
+  }
+
+  return {
+    candidate_diagnostics: [
+      `Latest CDIAC/DebtWatch refunding found for ${institution}: ${field.value}.`
+    ],
+    fields: [field],
+    source_candidates: [l1SourceCandidate(latestRefunding, institution)],
+    source_count: candidateRows.length
   };
 }
 
@@ -2089,6 +2191,7 @@ function mergeDebtWatchIssueRecord(
   const reportedBc = debtWatchText(issueRecord.BondCounsel);
   const reportedSaleDate = debtWatchDate(issueRecord.SaleDate);
   const reportedParAmount = debtWatchNumber(issueRecord.PrincipalAmount);
+  const reportedRefundingAmount = debtWatchNumber(issueRecord.RefundingAmount);
   const merged: MuniDealFactRow = {
     ...row,
     bc: reportedBc ?? row.bc,
@@ -2101,6 +2204,7 @@ function mergeDebtWatchIssueRecord(
     issuer_name_reported: firstString(row.issuer_name_reported, issueRecord.Issuer),
     ma: reportedMa ?? row.ma,
     municipal_advisor: reportedMa ?? row.municipal_advisor,
+    refunding_amount: reportedRefundingAmount ?? row.refunding_amount,
     source_layer: row.source_layer ?? "L1",
     source_title_primary: `CDIAC DebtWatch report ${reportedCdiacNumber}`,
     source_url_primary: debtWatchIssueReportUrl(reportedCdiacNumber),
@@ -2154,6 +2258,7 @@ function debtWatchIssueEvidenceExcerpt(row: MuniDealFactRow) {
     firstL1Value(row.deal_name) ? `Issue name: ${firstL1Value(row.deal_name)}` : "",
     row.deal_sale_date ? `Sale date: ${row.deal_sale_date}` : "",
     row.deal_par_amount ? `Par: ${formatParAmount(row.deal_par_amount)}` : "",
+    row.refunding_amount ? `Refunding Amount: ${formatParAmount(row.refunding_amount)}` : "",
     uw ? `Lead Underwriter: ${uw}` : "",
     ma ? `Financial/Municipal Advisor: ${ma}` : "",
     bc ? `Bond Counsel: ${bc}` : ""
@@ -2439,6 +2544,56 @@ function buildPlanDealFields(row: MuniDealFactRow): AutomationFieldResult[] {
       }
     ];
   });
+}
+
+function buildCcdRefundingsField(row: MuniDealFactRow): AutomationFieldResult | null {
+  const value = formatCcdRefundingSummary(row);
+
+  if (!value) {
+    return null;
+  }
+
+  return {
+    confidence: l1Confidence(row),
+    excerpt: l1EvidenceExcerpt(row),
+    field_key: "Refundings",
+    package_context: l1EvidenceExcerpt(row),
+    providers: [],
+    source_context: "CDIAC/DebtWatch refunding deal facts",
+    source_title: l1SourceTitle(row),
+    source_url: l1SourceUrl(row),
+    value
+  };
+}
+
+function isRefundingDealRow(row: MuniDealFactRow) {
+  const refundingAmount = l1RefundingAmount(row);
+
+  if (refundingAmount !== null) {
+    return refundingAmount > 0;
+  }
+
+  const normalizedEvidence = normalizeIdentityText(
+    [row.refunding_type, row.deal_name, row.deal_type, row.source_excerpt].filter(Boolean).join(" ")
+  );
+
+  return hasAnyPhrase(normalizedEvidence, ["refunding", "refunded", "refund "]);
+}
+
+function l1RefundingAmount(row: MuniDealFactRow) {
+  return debtWatchNumber(row.refunding_amount);
+}
+
+function formatCcdRefundingSummary(row: MuniDealFactRow) {
+  const saleDate = formatSaleMonthYear(row.deal_sale_date);
+  const refundingAmount = l1RefundingAmount(row);
+  const amount = formatParAmount(refundingAmount !== null && refundingAmount > 0 ? refundingAmount : row.deal_par_amount);
+
+  if (!saleDate && !amount) {
+    return null;
+  }
+
+  return [saleDate, amount ? `${amount} Refunding` : "Refunding"].filter(Boolean).join(" / ");
 }
 
 function formatPlanSaleDate(value: string | null | undefined) {
@@ -5041,6 +5196,16 @@ function buildNoSuggestionDiagnostic(
     };
   }
 
+  if (sourceProfile === "ccd-refundings") {
+    return {
+      institution,
+      message: extractedFieldCount
+        ? `Found ${extractedFieldCount} refunding candidate field${extractedFieldCount === 1 ? "" : "s"}, but none required an update.`
+        : `Checked ${sourceCount} recent CDIAC/DebtWatch deal fact${sourceCount === 1 ? "" : "s"}, but no supported refunding was found.` +
+          (candidateDiagnostics.length ? ` Candidates: ${candidateDiagnostics.join(" | ")}` : "")
+    };
+  }
+
   return {
     institution,
     message: extractedFieldCount
@@ -5806,7 +5971,10 @@ function minimumSuggestionConfidence(workflowKey: WorkflowKey) {
 function isDealWorkflow(workflowKey: WorkflowKey) {
   const sourceProfile = workflows[workflowKey].sourceProfile;
 
-  return sourceProfile === "deal-team" || sourceProfile === "last-deal" || sourceProfile === "plan-deal-facts";
+  return sourceProfile === "ccd-refundings" ||
+    sourceProfile === "deal-team" ||
+    sourceProfile === "last-deal" ||
+    sourceProfile === "plan-deal-facts";
 }
 
 function formatConfidence(value: number | null) {
