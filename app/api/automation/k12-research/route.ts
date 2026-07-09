@@ -2005,20 +2005,37 @@ async function researchAuthorizationFromIssuerDebtWatchAdtr(
       return detail ? { cdiacNumber, detail, issue } : null;
     })
   );
-  const authRows = details.flatMap((item) =>
+  const loadedDetails = details.filter(
+    (item): item is { cdiacNumber: string; detail: DebtWatchIssuanceDetailResponse; issue: DebtWatchIssueRecord } =>
+      Boolean(item)
+  );
+  const authRows = loadedDetails.flatMap((item) =>
     item ? extractDebtWatchAuthorizationRows(item.detail, item.cdiacNumber, item.issue) : []
   );
+  const sourceCandidates = issuesToOpen
+    .map((issue) => debtWatchText(issue.CDIACNumber))
+    .filter((cdiacNumber): cdiacNumber is string => Boolean(cdiacNumber))
+    .slice(0, 8)
+    .map((cdiacNumber) => debtWatchIssueSourceCandidate(cdiacNumber, institution));
+  const potentiallyStaleIssue = findPotentiallyNewerUnreportedAuthorizationIssue(loadedDetails, authRows);
+
+  if (potentiallyStaleIssue) {
+    return {
+      candidate_diagnostics: [
+        `Issuer-level CDIAC/DebtWatch ADTR scan found structured remaining authorization rows, but did not generate a suggestion because ${formatDebtWatchIssueReference(potentiallyStaleIssue)} is a newer GO issue with no structured ADTR authorization row yet and may have used the older remaining authorization.`
+      ],
+      fields: [],
+      source_candidates: sourceCandidates,
+      source_count: issuesToOpen.length
+    };
+  }
+
   const field = buildDebtWatchAuthorizationFieldFromRows(authRows, {
     confidence: 0.95,
     sourceContext: "CDIAC DebtWatch issuer-level ADTR authorization records",
     sourceTitle: `CDIAC DebtWatch issuer ADTR authorization scan for ${institution}`,
     sourceUrl: debtWatchIssuerSearchUrl(institution)
   });
-  const sourceCandidates = issuesToOpen
-    .map((issue) => debtWatchText(issue.CDIACNumber))
-    .filter((cdiacNumber): cdiacNumber is string => Boolean(cdiacNumber))
-    .slice(0, 8)
-    .map((cdiacNumber) => debtWatchIssueSourceCandidate(cdiacNumber, institution));
 
   if (!field) {
     return {
@@ -2220,6 +2237,88 @@ function isLikelyPureRefundingDebtWatchIssue(issue: DebtWatchIssueRecord) {
   const normalizedEvidence = normalizeIdentityText([issue.IssueName, issue.ProjectSeriesOrName].filter(Boolean).join(" "));
 
   return hasAnyPhrase(normalizedEvidence, ["refunding", "refunded"]);
+}
+
+function findPotentiallyNewerUnreportedAuthorizationIssue(
+  details: Array<{ cdiacNumber: string; detail: DebtWatchIssuanceDetailResponse; issue: DebtWatchIssueRecord }>,
+  authRows: DebtWatchAuthorizationRow[]
+) {
+  const latestRows = latestDebtWatchAuthorizationRows(authRows).filter(
+    (row) => (debtWatchNumber(row.record.AuthAmountEndPeriod) ?? 0) > 0
+  );
+
+  if (!latestRows.length) {
+    return null;
+  }
+
+  return (
+    details.find((item) => {
+      const issueRecord = item.detail.datasetById?.issues?.record ?? item.issue;
+      const issueAuthRows = extractDebtWatchAuthorizationRows(item.detail, item.cdiacNumber, item.issue);
+
+      if (issueAuthRows.length || isLikelyPureRefundingDebtWatchIssue(issueRecord)) {
+        return false;
+      }
+
+      return latestRows.some((authRow) => issueMayConsumeAuthorizationRow(issueRecord, authRow));
+    }) ?? null
+  );
+}
+
+function issueMayConsumeAuthorizationRow(issue: DebtWatchIssueRecord, authRow: DebtWatchAuthorizationRow) {
+  const issueSaleYear = Number(String(issue.SaleDate ?? "").slice(0, 4));
+
+  if (!Number.isFinite(issueSaleYear) || issueSaleYear < authRow.reportingYear) {
+    return false;
+  }
+
+  const issueAmount = debtWatchNumber(issue.PrincipalAmount);
+  const remainingAmount = debtWatchNumber(authRow.record.AuthAmountEndPeriod);
+
+  if (
+    issueAmount !== null &&
+    remainingAmount !== null &&
+    remainingAmount > 0 &&
+    amountsAreClose(issueAmount, remainingAmount)
+  ) {
+    return true;
+  }
+
+  const normalizedIssue = normalizeIdentityText(
+    [issue.IssueName, issue.ProjectSeriesOrName, issue.DebtType].filter(Boolean).join(" ")
+  );
+  const normalizedAuthName = normalizeIdentityText(authRow.record.AuthName ?? "");
+  const authYear = String(debtWatchDate(authRow.record.AuthDate) ?? "").slice(0, 4);
+
+  return Boolean(
+    (normalizedAuthName && normalizedIssue.includes(normalizedAuthName)) ||
+      (authYear && normalizedIssue.includes(authYear))
+  );
+}
+
+function latestDebtWatchAuthorizationRows(authRows: DebtWatchAuthorizationRow[]) {
+  const usableRows = authRows.filter((row) => row.reportingYear > 0);
+  const latestReportingYear = Math.max(0, ...usableRows.map((row) => row.reportingYear).filter(Number.isFinite));
+
+  return latestReportingYear ? usableRows.filter((row) => row.reportingYear === latestReportingYear) : [];
+}
+
+function formatDebtWatchIssueReference(item: {
+  cdiacNumber: string;
+  detail?: DebtWatchIssuanceDetailResponse;
+  issue: DebtWatchIssueRecord;
+}) {
+  const issue = item.detail?.datasetById?.issues?.record ?? item.issue;
+  const saleDate = formatSaleMonthYear(debtWatchDate(issue.SaleDate));
+  const amount = formatParAmount(debtWatchNumber(issue.PrincipalAmount));
+  const issueName = firstString(issue.IssueName, issue.ProjectSeriesOrName);
+
+  return [
+    `CDIAC ${item.cdiacNumber}`,
+    [saleDate, amount, issueName].filter(Boolean).join(" / ")
+  ]
+    .filter(Boolean)
+    .join(" (") + (saleDate || amount || issueName ? ")" : "");
 }
 
 async function findAuthorizationDebtWatchIssue(
